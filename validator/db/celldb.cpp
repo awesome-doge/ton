@@ -372,6 +372,12 @@ void CellDbIn::store_cell(BlockIdExt block_id, td::Ref<vm::Cell> cell, td::Promi
 
   boc_->inc(cell);
   db_busy_ = true;
+  
+  // **OPTIMIZATION: Track pending updates to batch snapshot updates**
+  static td::uint32 pending_updates = 0;
+  static td::Timestamp last_snapshot_update = td::Timestamp::now();
+  pending_updates++;
+  
   boc_->prepare_commit_async(async_executor, [=, this, SelfId = actor_id(this), timer = std::move(timer),
                                               timer_prepare = td::Timer{}, promise = std::move(promise),
                                               cell = std::move(cell)](td::Result<td::Unit> Res) mutable {
@@ -401,15 +407,32 @@ void CellDbIn::store_cell(BlockIdExt block_id, td::Ref<vm::Cell> cell, td::Promi
           }
           td::Timer timer_write;
           vm::CellStorer stor{*cell_db_};
+          
+          // **OPTIMIZATION: Single batch for consistency and performance**
           cell_db_->begin_write_batch().ensure();
           set_block(get_empty_key_hash(), std::move(E));
           set_block(D.prev, std::move(P));
           set_block(key_hash, std::move(D));
           boc_->commit(stor).ensure();
           cell_db_->commit_write_batch().ensure();
+          
           timer_write.pause();
 
+          // **OPTIMIZATION: Batch snapshot updates to reduce overhead**
+          bool should_update_snapshot = false;
           if (!opts_->get_celldb_in_memory()) {
+            pending_updates--;
+            // Update snapshot every 10 operations or every 2 seconds
+            bool batch_threshold_reached = (pending_updates % 10) == 0;
+            bool time_threshold_reached = (td::Timestamp::now().at() - last_snapshot_update.at()) > 2.0;
+            
+            if (batch_threshold_reached || time_threshold_reached || pending_updates == 0) {
+              should_update_snapshot = true;
+              last_snapshot_update = td::Timestamp::now();
+            }
+          }
+          
+          if (should_update_snapshot) {
             boc_->set_loader(std::make_unique<vm::CellLoader>(cell_db_->snapshot(), on_load_callback_)).ensure();
             td::actor::send_closure(parent_, &CellDb::update_snapshot, cell_db_->snapshot());
           }
@@ -649,7 +672,26 @@ void CellDbIn::gc_cont2(BlockHandle handle) {
           timer_free_cells.reset();
 
           td::PerfWarningTimer timer_finish{"gccell_finish", 0.05};
+          
+          // **OPTIMIZATION: Batch snapshot updates for GC operations**
+          static td::uint32 pending_gc_updates = 0;
+          static td::Timestamp last_gc_snapshot_update = td::Timestamp::now();
+          
+          bool should_update_gc_snapshot = false;
           if (!opts_->get_celldb_in_memory()) {
+            pending_gc_updates++;
+            // Update snapshot every 5 GC operations or every 5 seconds for GC
+            bool gc_batch_threshold_reached = (pending_gc_updates % 5) == 0;
+            bool gc_time_threshold_reached = (td::Timestamp::now().at() - last_gc_snapshot_update.at()) > 5.0;
+            
+            if (gc_batch_threshold_reached || gc_time_threshold_reached) {
+              should_update_gc_snapshot = true;
+              last_gc_snapshot_update = td::Timestamp::now();
+              pending_gc_updates = 0;
+            }
+          }
+          
+          if (should_update_gc_snapshot) {
             boc_->set_loader(std::make_unique<vm::CellLoader>(cell_db_->snapshot(), on_load_callback_)).ensure();
             td::actor::send_closure(parent_, &CellDb::update_snapshot, cell_db_->snapshot());
           }
@@ -742,8 +784,27 @@ void CellDbIn::migrate_cells() {
   auto loader = std::make_unique<vm::CellLoader>(cell_db_->snapshot());
   boc_->set_loader(std::make_unique<vm::CellLoader>(*loader)).ensure();
   cell_db_->begin_write_batch().ensure();
+  
+  // **OPTIMIZATION: Dynamic batch size based on performance**
+  static td::uint32 optimal_batch_size = 128;
+  static double last_migration_time = 1.0;
+  
+  // Adjust batch size based on previous performance
+  if (migration_stats_->batches_ > 0) {
+    double avg_time_per_batch = migration_stats_->total_time_ / migration_stats_->batches_;
+    if (avg_time_per_batch > 0.5) {
+      // Too slow, reduce batch size
+      optimal_batch_size = std::max(32u, optimal_batch_size - 16);
+    } else if (avg_time_per_batch < 0.1) {
+      // Too fast, can increase batch size
+      optimal_batch_size = std::min(512u, optimal_batch_size + 32);
+    }
+  }
+  
   td::uint32 checked = 0, migrated = 0;
-  for (auto it = cells_to_migrate_.begin(); it != cells_to_migrate_.end() && checked < 128;) {
+  td::uint32 current_batch_size = std::min(optimal_batch_size, static_cast<td::uint32>(cells_to_migrate_.size()));
+  
+  for (auto it = cells_to_migrate_.begin(); it != cells_to_migrate_.end() && checked < current_batch_size;) {
     ++checked;
     td::Bits256 hash = *it;
     it = cells_to_migrate_.erase(it);
@@ -766,7 +827,9 @@ void CellDbIn::migrate_cells() {
   td::actor::send_closure(parent_, &CellDb::update_snapshot, cell_db_->snapshot());
 
   double time = timer.elapsed();
-  LOG(DEBUG) << "CellDb migration: migrated=" << migrated << " checked=" << checked << " time=" << time;
+  last_migration_time = time;
+  LOG(DEBUG) << "CellDb migration: migrated=" << migrated << " checked=" << checked << " time=" << time 
+             << " batch_size=" << current_batch_size << " optimal_batch_size=" << optimal_batch_size;
   ++migration_stats_->batches_;
   migration_stats_->migrated_cells_ += migrated;
   migration_stats_->checked_cells_ += checked;
@@ -775,8 +838,10 @@ void CellDbIn::migrate_cells() {
   if (cells_to_migrate_.empty()) {
     migration_active_ = false;
   } else {
+    // **OPTIMIZATION: Adaptive delay based on system load**
+    double adaptive_delay = std::min(10.0, std::max(0.1, time * 1.5));
     delay_action([SelfId = actor_id(this)] { td::actor::send_closure(SelfId, &CellDbIn::migrate_cells); },
-                 td::Timestamp::in(time * 2));
+                 td::Timestamp::in(adaptive_delay));
   }
 }
 

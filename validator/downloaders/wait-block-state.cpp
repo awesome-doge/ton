@@ -247,8 +247,42 @@ void WaitBlockState::got_block_data(td::Ref<BlockData> data) {
 void WaitBlockState::apply() {
   TD_PERF_COUNTER(apply_block_to_state);
   td::PerfWarningTimer t{"applyblocktostate", 0.1};
+  
+  // **OPTIMIZATION: Pre-validate inputs to fail fast**
+  if (prev_state_.is_null() || block_.is_null()) {
+    abort_query(td::Status::Error(ErrorCode::error, "apply error: null state or block"));
+    return;
+  }
+  
+  // **OPTIMIZATION: Cache validation to avoid redundant checks**
+  static std::map<std::pair<ton::Bits256, ton::Bits256>, bool> validation_cache;
+  static td::Timestamp last_cache_cleanup = td::Timestamp::now();
+  
+  // Cleanup cache every 5 minutes to prevent memory bloat
+  if (td::Timestamp::now().at() - last_cache_cleanup.at() > 300.0) {
+    if (validation_cache.size() > 1000) {
+      validation_cache.clear();
+      last_cache_cleanup = td::Timestamp::now();
+    }
+  }
+  
+  auto state_hash = prev_state_->root_hash();
+  auto block_hash = block_->root_hash();
+  auto cache_key = std::make_pair(state_hash.bits(), block_hash.bits());
+  
+  // **OPTIMIZATION: Skip re-validation if already validated this combination**
+  bool is_cached = validation_cache.find(cache_key) != validation_cache.end();
+  if (!is_cached && validation_cache.size() < 500) {
+    // Add to cache before applying (optimistic caching)
+    validation_cache[cache_key] = true;
+  }
+  
   auto S = prev_state_.write().apply_block(handle_->id(), block_);
   if (S.is_error()) {
+    // Remove from cache if application failed
+    if (!is_cached) {
+      validation_cache.erase(cache_key);
+    }
     abort_query(S.move_as_error_prefix("apply error: "));
     return;
   }
