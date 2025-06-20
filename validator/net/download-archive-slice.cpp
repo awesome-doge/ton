@@ -113,6 +113,28 @@ static std::map<adnl::AdnlNodeIdShort, NodeQuality> node_qualities_;
 static std::set<adnl::AdnlNodeIdShort> active_attempts_;
 static td::uint32 strategy_attempt_ = 0;
 
+// **NEW: Block-level data availability tracking**
+struct BlockAvailability {
+  td::uint32 not_found_count = 0;
+  td::uint32 total_attempts = 0;
+  td::Timestamp first_attempt;
+  td::Timestamp last_not_found;
+  
+  bool is_likely_unavailable() const {
+    if (total_attempts < 3) return false;  // Need some attempts first
+    double not_found_rate = double(not_found_count) / total_attempts;
+    bool recent_failures = (td::Timestamp::now().at() - last_not_found.at()) < 300.0;  // 5min
+    return not_found_rate > 0.8 && recent_failures;  // 80%+ not found rate
+  }
+  
+  td::uint32 recommended_delay() const {
+    if (!is_likely_unavailable()) return 0;
+    return std::min(300u, not_found_count * 30);  // Up to 5min delay, 30s per failure
+  }
+};
+
+static std::map<BlockSeqno, BlockAvailability> block_availability_;
+
 DownloadArchiveSlice::DownloadArchiveSlice(
     BlockSeqno masterchain_seqno, ShardIdFull shard_prefix, std::string tmp_dir, adnl::AdnlNodeIdShort local_id,
     overlay::OverlayIdShort overlay_id, adnl::AdnlNodeIdShort download_from, td::Timestamp timeout,
@@ -195,102 +217,134 @@ void DownloadArchiveSlice::finish_query() {
 std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::AdnlNodeIdShort>& nodes, td::uint32 count) {
   if (nodes.empty()) return {};
   
-  std::vector<std::pair<double, adnl::AdnlNodeIdShort>> scored_nodes;
-  td::uint32 new_nodes = 0;
-  td::uint32 experienced_nodes = 0;
-  td::uint32 blacklisted_nodes = 0;
+  std::vector<std::pair<double, adnl::AdnlNodeIdShort>> all_nodes;
+  std::vector<std::pair<double, adnl::AdnlNodeIdShort>> high_quality_nodes;  // **NEW: Track high-quality nodes**
+  std::vector<std::pair<double, adnl::AdnlNodeIdShort>> medium_nodes;
+  std::vector<std::pair<double, adnl::AdnlNodeIdShort>> new_nodes;
+  
+  td::uint32 new_count = 0;
+  td::uint32 experienced_count = 0;
+  td::uint32 blacklisted_count = 0;
+  td::uint32 high_quality_count = 0;
   
   for (auto& node : nodes) {
     auto it = node_qualities_.find(node);
     
     if (it == node_qualities_.end()) {
-      // **EXPLORATION: New unknown nodes get high priority**
-      scored_nodes.emplace_back(0.8, node);  // High score for exploration
-      new_nodes++;
+      // **EXPLORATION: New unknown nodes**
+      double new_node_score = 0.6;  // Moderate score for new nodes
+      all_nodes.emplace_back(new_node_score, node);
+      new_nodes.emplace_back(new_node_score, node);
+      new_count++;
       
-      // **NEW: Initialize tracking for new node (only once)**
+      // Initialize tracking for new node
       auto& quality = node_qualities_[node];
-      if (quality.first_seen.at() == 0.0) {  // Only initialize if not already done
+      if (quality.first_seen.at() == 0.0) {
         quality.first_seen = td::Timestamp::now();
-        LOG(INFO) << "🆕 Discovered new node " << node << " (total new: " << new_nodes << ")";
+        LOG(INFO) << "🆕 Discovered new node " << node;
       }
       
     } else {
       if (it->second.is_blacklisted()) {
-        blacklisted_nodes++;
+        blacklisted_count++;
+        LOG(INFO) << "🚫 Skipping blacklisted node " << node 
+                  << " (failures: " << it->second.failure_count << ")";
         continue;  // Skip blacklisted nodes
       }
       
       double score = it->second.get_score();
-      scored_nodes.emplace_back(score, node);
+      all_nodes.emplace_back(score, node);
+      
+      // **NEW: Categorize nodes by quality**
+      if (it->second.success_rate() >= 0.7 && it->second.total_attempts() >= 2) {
+        high_quality_nodes.emplace_back(score, node);
+        high_quality_count++;
+        LOG(INFO) << "⭐ High-quality node found: " << node 
+                  << " (score=" << score << ", success_rate=" << (it->second.success_rate() * 100) << "%)";
+      } else if (score >= 0.3 || it->second.is_new_node()) {
+        medium_nodes.emplace_back(score, node);
+      }
       
       if (it->second.is_new_node()) {
-        new_nodes++;
+        new_count++;
       } else {
-        experienced_nodes++;
+        experienced_count++;
       }
     }
   }
   
-  // **SMART SELECTION STRATEGY**
-  std::sort(scored_nodes.begin(), scored_nodes.end(), 
-            [](const auto& a, const auto& b) { return a.first > b.first; });
-  
+  // **PRIORITIZED SELECTION STRATEGY**
   std::vector<adnl::AdnlNodeIdShort> result;
-  td::uint32 selected_count = std::min(count, static_cast<td::uint32>(scored_nodes.size()));
+  td::uint32 selected_count = std::min(count, static_cast<td::uint32>(all_nodes.size()));
   
-  if (scored_nodes.empty()) {
-    LOG(WARNING) << "❌ No available nodes (blacklisted: " << blacklisted_nodes << ")";
+  if (all_nodes.empty()) {
+    LOG(WARNING) << "❌ No available nodes (blacklisted: " << blacklisted_count << ")";
     return result;
   }
   
-  // **ADAPTIVE EXPLORATION RATE**
-  double exploration_rate = 0.2;  // Base 20% exploration
-  if (new_nodes > experienced_nodes) {
-    exploration_rate = 0.4;  // More exploration when many new nodes available
-  } else if (experienced_nodes > 10) {
-    exploration_rate = 0.1;  // Less exploration when we have many experienced nodes
-  }
+  LOG(INFO) << "🎯 SELECTION ANALYSIS - Total: " << nodes.size() 
+            << " | High-Quality: " << high_quality_count 
+            << " | Medium: " << medium_nodes.size()
+            << " | New: " << new_count 
+            << " | Blacklisted: " << blacklisted_count;
   
-  td::uint32 explore_slots = static_cast<td::uint32>(selected_count * exploration_rate);
-  td::uint32 exploit_slots = selected_count - explore_slots;
-  
-  LOG(INFO) << "🎯 Node selection strategy - New: " << new_nodes 
-            << ", Experienced: " << experienced_nodes 
-            << ", Blacklisted: " << blacklisted_nodes
-            << " | Exploit: " << exploit_slots << ", Explore: " << explore_slots;
-  
-  // **EXPLOITATION: Select best performing nodes first**
-  for (td::uint32 i = 0; i < std::min(exploit_slots, static_cast<td::uint32>(scored_nodes.size())); i++) {
-    result.push_back(scored_nodes[i].second);
-    auto it = node_qualities_.find(scored_nodes[i].second);
-    if (it != node_qualities_.end()) {
-      LOG(INFO) << "✅ Selected EXPLOIT node " << scored_nodes[i].second 
-                << " (score=" << scored_nodes[i].first 
-                << ", success_rate=" << it->second.success_rate() 
-                << ", attempts=" << it->second.total_attempts() << ")";
-    }
-  }
-  
-  // **EXPLORATION: Randomly select from remaining nodes for exploration**
-  if (explore_slots > 0 && scored_nodes.size() > exploit_slots) {
-    std::vector<std::pair<double, adnl::AdnlNodeIdShort>> exploration_candidates;
-    for (td::uint32 i = exploit_slots; i < scored_nodes.size(); i++) {
-      exploration_candidates.push_back(scored_nodes[i]);
+  // **STRATEGY 1: PRIORITIZE HIGH-QUALITY NODES**
+  if (!high_quality_nodes.empty()) {
+    // Sort high-quality nodes by score
+    std::sort(high_quality_nodes.begin(), high_quality_nodes.end(), 
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    
+    // Select at least 60% from high-quality nodes
+    td::uint32 high_quality_slots = std::max(1u, static_cast<td::uint32>(selected_count * 0.6));
+    high_quality_slots = std::min(high_quality_slots, static_cast<td::uint32>(high_quality_nodes.size()));
+    
+    for (td::uint32 i = 0; i < high_quality_slots; i++) {
+      result.push_back(high_quality_nodes[i].second);
+      auto it = node_qualities_.find(high_quality_nodes[i].second);
+      LOG(INFO) << "✅ PRIORITY SELECT: " << high_quality_nodes[i].second 
+                << " | Score: " << high_quality_nodes[i].first
+                << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+                << " | Attempts: " << it->second.total_attempts();
     }
     
-    // Shuffle exploration candidates to add randomness
-    for (td::uint32 i = 0; i < std::min(explore_slots, static_cast<td::uint32>(exploration_candidates.size())); i++) {
-      td::uint32 random_idx = td::Random::fast(0, static_cast<td::int32>(exploration_candidates.size() - 1));
-      result.push_back(exploration_candidates[random_idx].second);
+    selected_count -= high_quality_slots;
+  }
+  
+  // **STRATEGY 2: FILL REMAINING SLOTS WITH EXPLORATION/MEDIUM NODES**
+  if (selected_count > 0) {
+    std::vector<std::pair<double, adnl::AdnlNodeIdShort>> remaining_candidates;
+    
+    // Combine medium and new nodes for remaining slots
+    remaining_candidates.insert(remaining_candidates.end(), medium_nodes.begin(), medium_nodes.end());
+    remaining_candidates.insert(remaining_candidates.end(), new_nodes.begin(), new_nodes.end());
+    
+    // Sort remaining candidates by score
+    std::sort(remaining_candidates.begin(), remaining_candidates.end(), 
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    
+    for (td::uint32 i = 0; i < std::min(selected_count, static_cast<td::uint32>(remaining_candidates.size())); i++) {
+      result.push_back(remaining_candidates[i].second);
       
-      auto it = node_qualities_.find(exploration_candidates[random_idx].second);
-      LOG(INFO) << "🔍 Selected EXPLORE node " << exploration_candidates[random_idx].second 
-                << " (score=" << exploration_candidates[random_idx].first 
-                << ", attempts=" << (it != node_qualities_.end() ? it->second.total_attempts() : 0) << ")";
-      
-      exploration_candidates.erase(exploration_candidates.begin() + random_idx);
+      auto it = node_qualities_.find(remaining_candidates[i].second);
+      if (it != node_qualities_.end()) {
+        LOG(INFO) << "🔍 EXPLORE SELECT: " << remaining_candidates[i].second 
+                  << " | Score: " << remaining_candidates[i].first
+                  << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+                  << " | Attempts: " << it->second.total_attempts();
+      } else {
+        LOG(INFO) << "🆕 NEW NODE SELECT: " << remaining_candidates[i].second 
+                  << " | Score: " << remaining_candidates[i].first;
+      }
     }
+  }
+  
+  // **FALLBACK: If no nodes selected, pick the best available**
+  if (result.empty() && !all_nodes.empty()) {
+    std::sort(all_nodes.begin(), all_nodes.end(), 
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    result.push_back(all_nodes[0].second);
+    LOG(WARNING) << "⚠️ FALLBACK SELECT: " << all_nodes[0].second 
+                 << " | Score: " << all_nodes[0].first;
   }
   
   return result;
@@ -307,6 +361,24 @@ void DownloadArchiveSlice::start_up() {
   auto r = R.move_as_ok();
   fd_ = std::move(r.first);
   tmp_name_ = std::move(r.second);
+
+  // **NEW: Check block-level data availability**
+  auto& block_avail = block_availability_[masterchain_seqno_];
+  if (block_avail.first_attempt.at() == 0.0) {
+    block_avail.first_attempt = td::Timestamp::now();
+  }
+  
+  if (block_avail.is_likely_unavailable()) {
+    td::uint32 delay = block_avail.recommended_delay();
+    LOG(WARNING) << "⏳ Block #" << masterchain_seqno_ << " likely unavailable"
+                 << " | NotFound: " << block_avail.not_found_count 
+                 << "/" << block_avail.total_attempts 
+                 << " | Delaying " << delay << "s";
+    
+    // Delay download attempt
+    alarm_timestamp() = td::Timestamp::in(static_cast<double>(delay));
+    return;
+  }
 
   LOG(INFO) << "📦 Starting optimized download of archive slice #" << masterchain_seqno_ 
             << " " << shard_prefix_.to_str();
