@@ -261,12 +261,12 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
       all_nodes.emplace_back(score, node);
       
       // **ENHANCED: More strict categorization for better quality control**
-      if (it->second.success_rate() >= 0.8 && it->second.total_attempts() >= 3) {  // **STRICTER: Higher requirements**
+      if (it->second.success_rate() >= 0.6 && it->second.total_attempts() >= 2) {  // **LOWERED: Easier requirements (was 80%, 3 attempts)**
         high_quality_nodes.emplace_back(score, node);
         high_quality_count++;
         LOG(INFO) << "⭐ High-quality node found: " << node 
                   << " (score=" << score << ", success_rate=" << (it->second.success_rate() * 100) << "%)";
-      } else if (it->second.is_new_node() || (score >= 0.4 && it->second.success_rate() >= 0.5)) {  // **STRICTER: Higher thresholds**
+      } else if (it->second.is_new_node() || (score >= 0.3 && it->second.success_rate() >= 0.3)) {  // **LOWERED: Easier thresholds**
         // Only medium nodes if they have decent success OR are new
         medium_nodes.emplace_back(score, node);
         LOG(INFO) << "🔶 Medium-quality node: " << node 
@@ -348,16 +348,14 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
     }
   }
   
-  // **STRATEGY 3: ONLY USE NEW NODES IF NO DECENT NODES AVAILABLE**
-  if (result.empty() && !new_nodes.empty()) {
-    // **SEVERELY LIMITED: Only use 1 new node at a time**
-    result.push_back(new_nodes[0].second);
-    LOG(WARNING) << "⚠️ NO QUALITY NODES AVAILABLE - Using 1 new node: " << new_nodes[0].second 
-                 << " | Ignoring " << (new_nodes.size() - 1) << " other new nodes";
-  }
-  
+  // **STRATEGY 3: ABSOLUTELY NO NEW NODES UNLESS DESPERATE**
   if (result.empty()) {
-    LOG(ERROR) << "💥 NO NODES SELECTED! This should not happen!";
+    LOG(ERROR) << "🚫 REFUSING TO USE NEW NODES! No quality nodes available from " 
+               << nodes.size() << " candidates"
+               << " | High-Quality: " << high_quality_count 
+               << " | Medium: " << medium_nodes.size()
+               << " | All filtered out due to low quality";
+    // Return empty result - system will request more nodes or fail cleanly
   }
   
   return result;
@@ -406,13 +404,12 @@ void DownloadArchiveSlice::start_up() {
     for (auto& pair : node_qualities_) {
       if (pair.second.is_blacklisted()) continue;
       
-      // **EXCELLENT: Any node with recent success**
-      if (pair.second.success_count > 0 && 
-          (td::Timestamp::now().at() - pair.second.last_success.at()) < 3600.0) {  // Success within 1 hour
+      // **EXCELLENT: Any node with ANY success record (removed time constraint)**
+      if (pair.second.success_count > 0) {  // **SIMPLIFIED: Any success makes it excellent**
         excellent_nodes.push_back(pair.first);
       }
-      // **GOOD: Nodes with decent track record**
-      else if (pair.second.success_rate() >= 0.5 && 
+      // **GOOD: Nodes with decent track record but no successes yet**
+      else if (pair.second.success_rate() >= 0.3 && 
                pair.second.total_attempts() >= 2) {
         good_nodes.push_back(pair.first);
       }
@@ -423,24 +420,21 @@ void DownloadArchiveSlice::start_up() {
               << " | Total known=" << node_qualities_.size();
     
     if (!excellent_nodes.empty()) {
-      // **INCREASED: 95% probability to use excellent nodes (was 90%)**
-      bool use_excellent_node = (td::Random::fast(1, 100) <= 95);
-      
-      if (use_excellent_node) {
-        // Sort by combined score and recency
-        std::sort(excellent_nodes.begin(), excellent_nodes.end(), 
-                  [](const adnl::AdnlNodeIdShort& a, const adnl::AdnlNodeIdShort& b) {
-                    auto it_a = node_qualities_.find(a);
-                    auto it_b = node_qualities_.find(b);
-                    
-                    // **NEW: Prioritize by success count first, then by recency**
-                    if (it_a->second.success_count != it_b->second.success_count) {
-                      return it_a->second.success_count > it_b->second.success_count;
-                    }
-                    
-                    // Then by how recent the last success was
-                    return it_a->second.last_success.at() > it_b->second.last_success.at();
-                  });
+      // **FORCE REUSE: Always use excellent nodes - NO exploration**
+      // Sort by combined score and recency
+      std::sort(excellent_nodes.begin(), excellent_nodes.end(), 
+                [](const adnl::AdnlNodeIdShort& a, const adnl::AdnlNodeIdShort& b) {
+                  auto it_a = node_qualities_.find(a);
+                  auto it_b = node_qualities_.find(b);
+                  
+                  // **NEW: Prioritize by success count first, then by recency**
+                  if (it_a->second.success_count != it_b->second.success_count) {
+                    return it_a->second.success_count > it_b->second.success_count;
+                  }
+                  
+                  // Then by how recent the last success was
+                  return it_a->second.last_success.at() > it_b->second.last_success.at();
+                });
         
         // **NEW: Pick from top 3 excellent nodes with some randomness**
         td::uint32 top_excellent_count = std::min(3u, static_cast<td::uint32>(excellent_nodes.size()));
@@ -448,7 +442,7 @@ void DownloadArchiveSlice::start_up() {
         
         auto chosen_node = excellent_nodes[selected_idx];
         auto it = node_qualities_.find(chosen_node);
-        LOG(INFO) << "🏆 REUSING EXCELLENT NODE: " << chosen_node
+        LOG(INFO) << "🏆 FORCE REUSING EXCELLENT NODE: " << chosen_node
                   << " | Success Count: " << it->second.success_count
                   << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
                   << " | Last Success: " << (td::Timestamp::now().at() - it->second.last_success.at()) << "s ago"
@@ -456,35 +450,24 @@ void DownloadArchiveSlice::start_up() {
         
         got_node_to_download(chosen_node);
         return;
-      } else {
-        LOG(INFO) << "🎲 EXPLORATION MODE: Skipping " << excellent_nodes.size() 
-                  << " excellent nodes to explore new options (5% chance)";
-      }
     } else if (!good_nodes.empty()) {
-      // **NEW: If no excellent nodes, 80% chance to use good nodes**
-      bool use_good_node = (td::Random::fast(1, 100) <= 80);
-      
-      if (use_good_node) {
-        std::sort(good_nodes.begin(), good_nodes.end(), 
-                  [](const adnl::AdnlNodeIdShort& a, const adnl::AdnlNodeIdShort& b) {
-                    auto it_a = node_qualities_.find(a);
-                    auto it_b = node_qualities_.find(b);
-                    return it_a->second.get_score() > it_b->second.get_score();
-                  });
+      // **FORCE REUSE: Always use good nodes - NO exploration**
+      std::sort(good_nodes.begin(), good_nodes.end(), 
+                [](const adnl::AdnlNodeIdShort& a, const adnl::AdnlNodeIdShort& b) {
+                  auto it_a = node_qualities_.find(a);
+                  auto it_b = node_qualities_.find(b);
+                  return it_a->second.get_score() > it_b->second.get_score();
+                });
         
         auto chosen_node = good_nodes[0];
         auto it = node_qualities_.find(chosen_node);
-        LOG(INFO) << "⭐ REUSING GOOD NODE: " << chosen_node
+        LOG(INFO) << "⭐ FORCE REUSING GOOD NODE: " << chosen_node
                   << " | Score: " << it->second.get_score()
                   << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
                   << " | Attempts: " << it->second.total_attempts();
         
         got_node_to_download(chosen_node);
         return;
-      } else {
-        LOG(INFO) << "🎲 EXPLORATION MODE: Skipping " << good_nodes.size() 
-                  << " good nodes to explore new options (20% chance)";
-      }
     } else {
       LOG(INFO) << "🔍 No known excellent or good nodes available, requesting from overlay...";
     }
