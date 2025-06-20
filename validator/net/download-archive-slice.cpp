@@ -43,12 +43,12 @@ struct NodeQuality {
   double get_score() const {
     if (success_count + failure_count == 0) return 0.5;
     double success_rate = double(success_count) / (success_count + failure_count);
-    double time_penalty = last_failure.is_in_past(600.0) ? 0.0 : 0.3;
+    double time_penalty = (td::Timestamp::now().at() - last_failure.at()) < 600.0 ? 0.3 : 0.0;
     return std::max(0.0, success_rate - time_penalty);
   }
   
   bool is_blacklisted() const {
-    return failure_count >= 3 && !last_failure.is_in_past(900.0);  // 15min blacklist
+    return failure_count >= 3 && (td::Timestamp::now().at() - last_failure.at()) < 900.0;  // 15min blacklist
   }
 };
 
@@ -141,7 +141,7 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
             [](const auto& a, const auto& b) { return a.first > b.first; });
   
   std::vector<adnl::AdnlNodeIdShort> result;
-  for (td::uint32 i = 0; i < std::min(count, td::uint32(scored_nodes.size())); i++) {
+  for (td::uint32 i = 0; i < std::min(count, static_cast<td::uint32>(scored_nodes.size())); i++) {
     result.push_back(scored_nodes[i].second);
   }
   
@@ -174,7 +174,7 @@ void DownloadArchiveSlice::start_up() {
                                   td::Status::Error(ErrorCode::notready, "no nodes"));
         } else {
           // **OPTIMIZATION: Select best nodes instead of random**
-          auto best_nodes = select_best_nodes(vec, std::min<td::uint32>(vec.size(), 3));
+          auto best_nodes = select_best_nodes(vec, std::min(static_cast<td::uint32>(vec.size()), static_cast<td::uint32>(3)));
           if (!best_nodes.empty()) {
             LOG(INFO) << "🔍 Selected best node from " << vec.size() << " candidates";
             td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, best_nodes[0]);
@@ -307,10 +307,10 @@ void DownloadArchiveSlice::got_archive_slice(td::BufferSlice data) {
   double elapsed = prev_logged_timer_.elapsed();
   if (elapsed > 3.0) {  // Log every 3 seconds
     prev_logged_timer_ = td::Timer();
-    auto speed = (offset_ - prev_logged_sum_) / elapsed;
+    auto speed = static_cast<double>(offset_ - prev_logged_sum_) / elapsed;
     LOG(INFO) << "⬇️  Downloading archive slice #" << masterchain_seqno_ 
               << " " << shard_prefix_.to_str() << ": " << td::format::as_size(offset_)
-              << " (" << td::format::as_size(td::uint64(speed)) << "/s)";
+              << " (" << td::format::as_size(static_cast<td::uint64>(speed)) << "/s)";
     prev_logged_sum_ = offset_;
   }
 

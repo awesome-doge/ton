@@ -1,6 +1,11 @@
 #!/bin/bash
 
-echo "🚀 TON Archive Download Optimizer"
+# TON Validator Archive Download Optimization Script
+# 歸檔下載優化腳本
+
+set -e
+
+echo "🚀 TON 歸檔下載優化部署腳本"
 echo "=================================="
 
 # Colors for output
@@ -28,120 +33,108 @@ print_error() {
 }
 
 # Check if we're in the TON directory
-if [ ! -f "CMakeLists.txt" ] || [ ! -d "validator" ]; then
-    print_error "請在 TON 項目根目錄中運行此腳本"
+if [ ! -f "build/validator-engine/validator-engine" ]; then
+    echo "❌ 錯誤：找不到編譯好的 validator-engine"
+    echo "請確保："
+    echo "1. 當前目錄是 TON 源碼根目錄"
+    echo "2. 已經成功編譯了 validator-engine"
+    echo "3. build/validator-engine/validator-engine 文件存在"
     exit 1
 fi
 
-print_info "正在備份原始文件..."
-
-# Backup original files
-if [ ! -f "validator/net/download-archive-slice.cpp.backup" ]; then
-    cp validator/net/download-archive-slice.cpp validator/net/download-archive-slice.cpp.backup
-    print_status "已備份原始 download-archive-slice.cpp"
-else
-    print_warning "備份文件已存在，跳過備份"
+# Get current user input for deployment path
+echo "請輸入當前 validator-engine 的安裝路徑（默認：/usr/bin/ton/validator-engine/validator-engine）："
+read -r VALIDATOR_PATH
+if [ -z "$VALIDATOR_PATH" ]; then
+    VALIDATOR_PATH="/usr/bin/ton/validator-engine/validator-engine"
 fi
 
-print_info "優化功能概述："
-echo "=================================="
-echo "🎯 智能節點選擇 - 基於歷史表現選擇最佳節點"
-echo "⚡ 節點質量評估 - 跟踪成功率和速度"
-echo "🚫 節點黑名單 - 自動避免失敗的節點"
-echo "📊 增強日誌 - 更詳細的下載進度信息"
-echo "🔄 優化重試 - 智能重試和超時策略"
-echo "=================================="
-
-# Check if optimization is already applied
-if grep -q "Node quality tracking" validator/net/download-archive-slice.cpp; then
-    print_status "優化已經應用！"
-else
-    print_error "優化未正確應用，請檢查修改是否成功"
+if [ ! -f "$VALIDATOR_PATH" ]; then
+    echo "❌ 錯誤：找不到現有的 validator-engine 在 $VALIDATOR_PATH"
+    echo "請確認路徑是否正確"
     exit 1
 fi
 
-print_info "開始編譯..."
+echo "📋 部署信息："
+echo "  - 源文件：build/validator-engine/validator-engine"
+echo "  - 目標路徑：$VALIDATOR_PATH"
+echo "  - 備份路徑：${VALIDATOR_PATH}.backup"
 
-# Create build directory if it doesn't exist
-if [ ! -d "build" ]; then
-    mkdir build
-    print_status "創建 build 目錄"
-fi
-
-cd build
-
-# Configure CMake
-print_info "配置 CMake..."
-cmake .. -DCMAKE_BUILD_TYPE=Release
-
-if [ $? -eq 0 ]; then
-    print_status "CMake 配置成功"
-else
-    print_error "CMake 配置失敗"
+echo ""
+echo "⚠️  警告：此操作將："
+echo "  1. 停止 validator 服務"
+echo "  2. 備份當前 validator-engine"
+echo "  3. 部署優化版本"
+echo "  4. 重啟 validator 服務"
+echo ""
+read -p "確認繼續？(y/N): " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "❌ 取消部署"
     exit 1
 fi
 
-# Build the project
-print_info "編譯項目（這可能需要一些時間）..."
-make -j$(nproc) validator-engine
+echo ""
+echo "🔄 開始部署..."
 
-if [ $? -eq 0 ]; then
-    print_status "編譯成功！"
+# Check if we need sudo
+SUDO=""
+if [ "$EUID" -ne 0 ]; then
+    echo "需要 sudo 權限來部署和重啟服務..."
+    SUDO="sudo"
+fi
+
+# Step 1: Stop validator service
+echo "1️⃣ 停止 validator 服務..."
+if $SUDO systemctl is-active --quiet validator; then
+    $SUDO systemctl stop validator
+    echo "✅ Validator 服務已停止"
 else
-    print_error "編譯失敗"
+    echo "ℹ️  Validator 服務未運行"
+fi
+
+# Step 2: Backup current version
+echo "2️⃣ 備份當前版本..."
+$SUDO cp "$VALIDATOR_PATH" "${VALIDATOR_PATH}.backup"
+echo "✅ 備份完成：${VALIDATOR_PATH}.backup"
+
+# Step 3: Deploy new version
+echo "3️⃣ 部署優化版本..."
+$SUDO cp "build/validator-engine/validator-engine" "$VALIDATOR_PATH"
+$SUDO chmod +x "$VALIDATOR_PATH"
+echo "✅ 優化版本部署完成"
+
+# Step 4: Restart validator service
+echo "4️⃣ 重啟 validator 服務..."
+$SUDO systemctl start validator
+sleep 3
+
+if $SUDO systemctl is-active --quiet validator; then
+    echo "✅ Validator 服務已成功重啟"
+else
+    echo "❌ Validator 服務啟動失敗，正在回滾..."
+    $SUDO cp "${VALIDATOR_PATH}.backup" "$VALIDATOR_PATH"
+    $SUDO systemctl start validator
+    echo "🔄 已回滾到原版本"
     exit 1
 fi
 
-cd ..
-
-print_info "檢查當前節點配置..."
-
-# Check current validator service
-if systemctl is-active --quiet validator; then
-    print_warning "檢測到運行中的驗證器服務"
-    
-    echo -e "${YELLOW}是否要停止服務並更新二進制文件？ (y/n)${NC}"
-    read -r response
-    
-    if [[ "$response" =~ ^[Yy]$ ]]; then
-        print_info "停止驗證器服務..."
-        systemctl stop validator
-        
-        print_info "備份當前二進制文件..."
-        if [ -f "/usr/bin/ton/validator-engine/validator-engine" ]; then
-            cp /usr/bin/ton/validator-engine/validator-engine /usr/bin/ton/validator-engine/validator-engine.backup
-        fi
-        
-        print_info "複製優化後的二進制文件..."
-        cp build/validator-engine/validator-engine /usr/bin/ton/validator-engine/validator-engine
-        
-        print_status "二進制文件更新完成"
-        
-        echo -e "${YELLOW}是否要啟動驗證器服務？ (y/n)${NC}"
-        read -r start_response
-        
-        if [[ "$start_response" =~ ^[Yy]$ ]]; then
-            systemctl start validator
-            print_status "驗證器服務已啟動"
-        fi
-    fi
-else
-    print_info "沒有檢測到運行中的驗證器服務"
-    print_info "優化後的二進制文件位於: $(pwd)/build/validator-engine/validator-engine"
-fi
-
 echo ""
-print_status "🎉 優化完成！"
+echo "🎉 部署完成！"
 echo ""
-print_info "優化效果："
-echo "• 📈 預期下載成功率提升 60-80%"
-echo "• ⚡ 減少 'remote db not found' 錯誤"
-echo "• 🎯 智能選擇高質量節點"
-echo "• 📊 更詳細的下載進度日誌"
+echo "📊 監控命令："
+echo "  查看實時日誌：sudo journalctl -u validator -f"
+echo "  查看優化日誌：sudo journalctl -u validator -f | grep -E '(📦|✅|❌|🔍|⬇️)'"
 echo ""
-print_info "監控日誌以查看優化效果："
-echo "journalctl -u validator -f | grep -E '(📦|✅|❌|⬇️|🔍)'"
+echo "🔍 預期改善："
+echo "  - 智能節點選擇（🔍 Selected best node）"
+echo "  - 節點質量跟踪（✅ Node success, score=）"
+echo "  - 自動黑名單（❌ Node blacklisted）"
+echo "  - 下載進度優化（⬇️ Downloading archive slice）"
 echo ""
-print_info "如需恢復原始版本："
-echo "cp validator/net/download-archive-slice.cpp.backup validator/net/download-archive-slice.cpp"
-echo "然後重新編譯並部署" 
+echo "⚡ 如遇問題，回滾命令："
+echo "  sudo systemctl stop validator"
+echo "  sudo cp ${VALIDATOR_PATH}.backup $VALIDATOR_PATH"
+echo "  sudo systemctl start validator"
+echo ""
+echo "✨ 祝您的 TON 驗證器運行順利！" 
