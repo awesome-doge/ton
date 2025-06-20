@@ -283,7 +283,7 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
     }
   }
   
-  // **PRIORITIZED SELECTION STRATEGY**
+  // **PRIORITIZED SELECTION STRATEGY - FOCUS ON QUALITY ONLY**
   std::vector<adnl::AdnlNodeIdShort> result;
   td::uint32 selected_count = std::min(count, static_cast<td::uint32>(all_nodes.size()));
   
@@ -298,88 +298,62 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
             << " | New: " << new_count 
             << " | Blacklisted: " << blacklisted_count;
   
-  // **STRATEGY 1: PRIORITIZE HIGH-QUALITY NODES**
+  // **STRATEGY 1: USE HIGH-QUALITY NODES ONLY IF AVAILABLE**
   if (!high_quality_nodes.empty()) {
     // Sort high-quality nodes by score
     std::sort(high_quality_nodes.begin(), high_quality_nodes.end(), 
               [](const auto& a, const auto& b) { return a.first > b.first; });
     
-    // **INCREASED: Select at least 80% from high-quality nodes (was 60%)**
-    td::uint32 high_quality_slots = std::max(1u, static_cast<td::uint32>(selected_count * 0.8));
-    high_quality_slots = std::min(high_quality_slots, static_cast<td::uint32>(high_quality_nodes.size()));
-    
-    for (td::uint32 i = 0; i < high_quality_slots; i++) {
-      result.push_back(high_quality_nodes[i].second);
-      auto it = node_qualities_.find(high_quality_nodes[i].second);
-      LOG(INFO) << "✅ PRIORITY SELECT: " << high_quality_nodes[i].second 
-                << " | Score: " << high_quality_nodes[i].first
+    // **PRIORITIZE: Use ALL high-quality nodes first**
+    for (auto& node_pair : high_quality_nodes) {
+      if (result.size() >= selected_count) break;
+      result.push_back(node_pair.second);
+      auto it = node_qualities_.find(node_pair.second);
+      LOG(INFO) << "✅ PRIORITY SELECT: " << node_pair.second 
+                << " | Score: " << node_pair.first
                 << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
                 << " | Attempts: " << it->second.total_attempts();
     }
     
-    selected_count -= high_quality_slots;
+    // If high-quality nodes fill our needs, return immediately
+    if (!result.empty()) {
+      LOG(INFO) << "🎯 Using only " << result.size() << " high-quality nodes, ignoring " 
+                << new_count << " new nodes";
+      return result;
+    }
   }
   
-  // **STRATEGY 2: PRIORITIZE MEDIUM NODES OVER NEW NODES**
-  if (selected_count > 0) {
-    std::vector<std::pair<double, adnl::AdnlNodeIdShort>> remaining_candidates;
-    
-    // **CHANGED: Prioritize medium nodes first, then new nodes**
-    remaining_candidates.insert(remaining_candidates.end(), medium_nodes.begin(), medium_nodes.end());
-    
-    // **LIMIT NEW NODE EXPLORATION: Only add a few new nodes**
-    td::uint32 max_new_nodes = std::min(static_cast<td::uint32>(2), selected_count);  // **LIMIT: Max 2 new nodes**
-    td::uint32 added_new_nodes = 0;
-    for (auto& new_node : new_nodes) {
-      if (added_new_nodes >= max_new_nodes) break;
-      remaining_candidates.push_back(new_node);
-      added_new_nodes++;
-    }
-    
-    // Sort remaining candidates by score
-    std::sort(remaining_candidates.begin(), remaining_candidates.end(), 
+  // **STRATEGY 2: IF NO HIGH-QUALITY, USE MEDIUM NODES ONLY**
+  if (!medium_nodes.empty()) {
+    // Sort medium nodes by score
+    std::sort(medium_nodes.begin(), medium_nodes.end(), 
               [](const auto& a, const auto& b) { return a.first > b.first; });
     
-    for (td::uint32 i = 0; i < std::min(selected_count, static_cast<td::uint32>(remaining_candidates.size())); i++) {
-      result.push_back(remaining_candidates[i].second);
+    for (auto& node_pair : medium_nodes) {
+      if (result.size() >= selected_count) break;
+      result.push_back(node_pair.second);
       
-      auto it = node_qualities_.find(remaining_candidates[i].second);
-      if (it != node_qualities_.end()) {
-        LOG(INFO) << "🔍 MEDIUM SELECT: " << remaining_candidates[i].second 
-                  << " | Score: " << remaining_candidates[i].first
-                  << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
-                  << " | Attempts: " << it->second.total_attempts();
-      } else {
-        LOG(INFO) << "🆕 LIMITED NEW NODE SELECT: " << remaining_candidates[i].second 
-                  << " | Score: " << remaining_candidates[i].first;
-      }
+      auto it = node_qualities_.find(node_pair.second);
+      LOG(INFO) << "🔍 MEDIUM SELECT: " << node_pair.second 
+                << " | Score: " << node_pair.first
+                << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+                << " | Attempts: " << it->second.total_attempts();
+    }
+    
+    // If medium nodes fill our needs, return immediately
+    if (!result.empty()) {
+      LOG(INFO) << "🎯 Using only " << result.size() << " medium-quality nodes, ignoring " 
+                << new_count << " new nodes";
+      return result;
     }
   }
   
-  // **FALLBACK: If no nodes selected, pick the best available**
-  if (result.empty() && !all_nodes.empty()) {
-    std::sort(all_nodes.begin(), all_nodes.end(), 
-              [](const auto& a, const auto& b) { return a.first > b.first; });
-    
-    // **STRICTER: Higher minimum score requirement**
-    std::vector<std::pair<double, adnl::AdnlNodeIdShort>> acceptable_fallback;
-    for (auto& node_pair : all_nodes) {
-      if (node_pair.first >= 0.3) {  // **INCREASED: At least 0.3 minimal score (was 0.1)**
-        acceptable_fallback.push_back(node_pair);
-      }
-    }
-    
-    if (!acceptable_fallback.empty()) {
-      result.push_back(acceptable_fallback[0].second);
-      LOG(WARNING) << "⚠️ FALLBACK SELECT (acceptable): " << acceptable_fallback[0].second 
-                   << " | Score: " << acceptable_fallback[0].first;
-    } else {
-      // **REMOVED: No more "last resort" selection of worst nodes**
-      LOG(ERROR) << "🚫 NO ACCEPTABLE NODES FOUND! All nodes have score < 0.3"
-                 << " | Best available score: " << (all_nodes.empty() ? 0.0 : all_nodes[0].first)
-                 << " | Refusing to use low-quality nodes";
-      // Don't select any node - let the system request new nodes instead
-    }
+  // **STRATEGY 3: ONLY USE NEW NODES IF NO DECENT NODES AVAILABLE**
+  if (result.empty() && !new_nodes.empty()) {
+    // **SEVERELY LIMITED: Only use 1 new node at a time**
+    result.push_back(new_nodes[0].second);
+    LOG(WARNING) << "⚠️ NO QUALITY NODES AVAILABLE - Using 1 new node: " << new_nodes[0].second 
+                 << " | Ignoring " << (new_nodes.size() - 1) << " other new nodes";
   }
   
   if (result.empty()) {
@@ -424,49 +398,95 @@ void DownloadArchiveSlice::start_up() {
             << " " << shard_prefix_.to_str();
 
   if (download_from_.is_zero() && client_.empty()) {
-    // **NEW: First try to use known high-quality nodes**
-    std::vector<adnl::AdnlNodeIdShort> known_good_nodes;
+    // **ENHANCED: More aggressive reuse of successful nodes**
+    std::vector<adnl::AdnlNodeIdShort> excellent_nodes;
+    std::vector<adnl::AdnlNodeIdShort> good_nodes;
+    
+    // **NEW: Categorize known nodes more granularly**
     for (auto& pair : node_qualities_) {
-      if (!pair.second.is_blacklisted() && 
-          pair.second.success_rate() >= 0.7 && 
-          pair.second.total_attempts() >= 2) {
-        known_good_nodes.push_back(pair.first);
+      if (pair.second.is_blacklisted()) continue;
+      
+      // **EXCELLENT: Any node with recent success**
+      if (pair.second.success_count > 0 && 
+          (td::Timestamp::now().at() - pair.second.last_success.at()) < 3600.0) {  // Success within 1 hour
+        excellent_nodes.push_back(pair.first);
+      }
+      // **GOOD: Nodes with decent track record**
+      else if (pair.second.success_rate() >= 0.5 && 
+               pair.second.total_attempts() >= 2) {
+        good_nodes.push_back(pair.first);
       }
     }
     
-    if (!known_good_nodes.empty()) {
-      // **CHANGED: 90% use known good nodes, 10% explore new nodes (was 80%/20%)**
-      bool use_known_node = (td::Random::fast(1, 100) <= 90);  // **INCREASED: 90% probability**
+    LOG(INFO) << "🔍 NODE INVENTORY: Excellent=" << excellent_nodes.size() 
+              << " | Good=" << good_nodes.size()
+              << " | Total known=" << node_qualities_.size();
+    
+    if (!excellent_nodes.empty()) {
+      // **INCREASED: 95% probability to use excellent nodes (was 90%)**
+      bool use_excellent_node = (td::Random::fast(1, 100) <= 95);
       
-      if (use_known_node) {
-        // Sort by score and pick the best
-        std::sort(known_good_nodes.begin(), known_good_nodes.end(), 
+      if (use_excellent_node) {
+        // Sort by combined score and recency
+        std::sort(excellent_nodes.begin(), excellent_nodes.end(), 
+                  [](const adnl::AdnlNodeIdShort& a, const adnl::AdnlNodeIdShort& b) {
+                    auto it_a = node_qualities_.find(a);
+                    auto it_b = node_qualities_.find(b);
+                    
+                    // **NEW: Prioritize by success count first, then by recency**
+                    if (it_a->second.success_count != it_b->second.success_count) {
+                      return it_a->second.success_count > it_b->second.success_count;
+                    }
+                    
+                    // Then by how recent the last success was
+                    return it_a->second.last_success.at() > it_b->second.last_success.at();
+                  });
+        
+        // **NEW: Pick from top 3 excellent nodes with some randomness**
+        td::uint32 top_excellent_count = std::min(3u, static_cast<td::uint32>(excellent_nodes.size()));
+        td::uint32 selected_idx = td::Random::fast(0, static_cast<td::int32>(top_excellent_count - 1));
+        
+        auto chosen_node = excellent_nodes[selected_idx];
+        auto it = node_qualities_.find(chosen_node);
+        LOG(INFO) << "🏆 REUSING EXCELLENT NODE: " << chosen_node
+                  << " | Success Count: " << it->second.success_count
+                  << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+                  << " | Last Success: " << (td::Timestamp::now().at() - it->second.last_success.at()) << "s ago"
+                  << " | Rank: " << (selected_idx + 1) << "/" << excellent_nodes.size();
+        
+        got_node_to_download(chosen_node);
+        return;
+      } else {
+        LOG(INFO) << "🎲 EXPLORATION MODE: Skipping " << excellent_nodes.size() 
+                  << " excellent nodes to explore new options (5% chance)";
+      }
+    } else if (!good_nodes.empty()) {
+      // **NEW: If no excellent nodes, 80% chance to use good nodes**
+      bool use_good_node = (td::Random::fast(1, 100) <= 80);
+      
+      if (use_good_node) {
+        std::sort(good_nodes.begin(), good_nodes.end(), 
                   [](const adnl::AdnlNodeIdShort& a, const adnl::AdnlNodeIdShort& b) {
                     auto it_a = node_qualities_.find(a);
                     auto it_b = node_qualities_.find(b);
                     return it_a->second.get_score() > it_b->second.get_score();
                   });
         
-        // **ENHANCED: Add some randomness among top nodes to avoid overusing single node**
-        td::uint32 top_nodes_count = std::min(3u, static_cast<td::uint32>(known_good_nodes.size()));
-        td::uint32 selected_idx = td::Random::fast(0, static_cast<td::int32>(top_nodes_count - 1));
-        
-        auto best_known = known_good_nodes[selected_idx];
-        auto it = node_qualities_.find(best_known);
-        LOG(INFO) << "🏆 PRIORITIZING known high-quality node: " << best_known
+        auto chosen_node = good_nodes[0];
+        auto it = node_qualities_.find(chosen_node);
+        LOG(INFO) << "⭐ REUSING GOOD NODE: " << chosen_node
                   << " | Score: " << it->second.get_score()
                   << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
-                  << " | Attempts: " << it->second.total_attempts()
-                  << " | Rank: " << (selected_idx + 1) << "/" << known_good_nodes.size();
+                  << " | Attempts: " << it->second.total_attempts();
         
-        got_node_to_download(best_known);
+        got_node_to_download(chosen_node);
         return;
       } else {
-        LOG(INFO) << "🎲 EXPLORATION MODE: Skipping " << known_good_nodes.size() 
-                  << " known good nodes to explore new options (10% chance)";
+        LOG(INFO) << "🎲 EXPLORATION MODE: Skipping " << good_nodes.size() 
+                  << " good nodes to explore new options (20% chance)";
       }
     } else {
-      LOG(INFO) << "🔍 No known high-quality nodes available, requesting from overlay...";
+      LOG(INFO) << "🔍 No known excellent or good nodes available, requesting from overlay...";
     }
 
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), this](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
@@ -511,8 +531,8 @@ void DownloadArchiveSlice::start_up() {
       }
     });
 
-    // **OPTIMIZATION: Request more nodes for better selection**
-    td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 6,
+    // **OPTIMIZATION: Request fewer nodes for better focus on quality**
+    td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 4,
                             std::move(P));
   } else {
     got_node_to_download(download_from_);
@@ -689,8 +709,8 @@ void DownloadArchiveSlice::got_archive_slice(td::BufferSlice data) {
 void DownloadArchiveSlice::request_more_nodes(td::Promise<std::vector<adnl::AdnlNodeIdShort>> promise) {
   LOG(INFO) << "🔄 Requesting additional nodes due to blacklist situation";
   
-  // Request double the usual amount for better chances
-  td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 12,
+  // **REDUCED: Request fewer nodes to avoid too many unknowns (was 12)**
+  td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 6,
                           std::move(promise));
 }
 
