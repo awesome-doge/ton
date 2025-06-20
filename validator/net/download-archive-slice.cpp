@@ -121,15 +121,11 @@ struct BlockAvailability {
   td::Timestamp last_not_found;
   
   bool is_likely_unavailable() const {
-    if (total_attempts < 2) return false;  // **REDUCED: Need fewer attempts to trigger (was 3)**
-    double not_found_rate = double(not_found_count) / total_attempts;
-    bool recent_failures = (td::Timestamp::now().at() - last_not_found.at()) < 600.0;  // **INCREASED: 10min (was 5min)**
-    return not_found_rate > 0.6 && recent_failures;  // **REDUCED: 60%+ not found rate (was 80%)**
+    return false;  // **DISABLED: Never consider blocks unavailable to avoid delays**
   }
   
   td::uint32 recommended_delay() const {
-    if (!is_likely_unavailable()) return 0;
-    return std::min(600u, not_found_count * 60);  // **INCREASED: Up to 10min delay, 60s per failure (was 30s)**
+    return 0;  // **DISABLED: Never delay download attempts**
   }
 };
 
@@ -415,17 +411,18 @@ void DownloadArchiveSlice::start_up() {
     block_avail.first_attempt = td::Timestamp::now();
   }
   
-  if (block_avail.is_likely_unavailable()) {
-    td::uint32 delay = block_avail.recommended_delay();
-    LOG(WARNING) << "⏳ Block #" << masterchain_seqno_ << " likely unavailable"
-                 << " | NotFound: " << block_avail.not_found_count 
-                 << "/" << block_avail.total_attempts 
-                 << " | Delaying " << delay << "s";
-    
-    // Delay download attempt
-    alarm_timestamp() = td::Timestamp::in(static_cast<double>(delay));
-    return;
-  }
+  // **DISABLED: Skip delay logic completely**
+  // if (block_avail.is_likely_unavailable()) {
+  //   td::uint32 delay = block_avail.recommended_delay();
+  //   LOG(WARNING) << "⏳ Block #" << masterchain_seqno_ << " likely unavailable"
+  //                << " | NotFound: " << block_avail.not_found_count 
+  //                << "/" << block_avail.total_attempts 
+  //                << " | Delaying " << delay << "s";
+  //   
+  //   // Delay download attempt
+  //   alarm_timestamp() = td::Timestamp::in(static_cast<double>(delay));
+  //   return;
+  // }
 
   LOG(INFO) << "📦 Starting optimized download of archive slice #" << masterchain_seqno_ 
             << " " << shard_prefix_.to_str();
