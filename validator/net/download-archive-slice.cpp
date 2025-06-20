@@ -36,59 +36,77 @@ namespace fullnode {
 struct NodeQuality {
   td::uint32 success_count = 0;
   td::uint32 failure_count = 0;
-  td::uint32 archive_not_found_count = 0;  // **NEW: Track specific error type**
+  td::uint32 archive_not_found_count = 0;
   td::Timestamp last_success;
   td::Timestamp last_failure;
+  td::Timestamp first_seen;
   double avg_speed = 0.0;
+  double total_download_time = 0.0;
+  
+  // **NEW: Advanced metrics for explore-exploit strategy**
+  td::uint32 total_attempts() const { return success_count + failure_count; }
+  
+  double success_rate() const {
+    if (total_attempts() == 0) return 0.0;
+    return double(success_count) / total_attempts();
+  }
+  
+  double confidence_interval() const {
+    if (total_attempts() == 0) return 1.0;  // High uncertainty for new nodes
+    // Upper Confidence Bound calculation
+    double exploration_factor = std::sqrt(2.0 * std::log(100.0) / total_attempts());
+    return std::min(1.0, success_rate() + exploration_factor);
+  }
+  
+  bool is_new_node() const {
+    return total_attempts() < 3;  // Node with less than 3 attempts is considered "new"
+  }
   
   double get_score() const {
-    if (success_count + failure_count == 0) return 0.5;
-    double success_rate = double(success_count) / (success_count + failure_count);
-    double time_penalty = (td::Timestamp::now().at() - last_failure.at()) < 600.0 ? 0.3 : 0.0;
+    if (total_attempts() == 0) return 0.8;  // **HIGH score for completely unknown nodes**
     
-    // **NEW: Less penalty for "archive not found" errors (data availability issue, not node issue)**
-    if (archive_not_found_count > failure_count * 0.8) {
-      time_penalty *= 0.5;  // Reduce penalty for data availability issues
+    double base_score = success_rate();
+    
+    // **EXPLORATION BONUS: Encourage trying new or rarely used nodes**
+    double exploration_bonus = 0.0;
+    if (is_new_node()) {
+      exploration_bonus = 0.3;  // Strong bonus for new nodes
+    } else if (total_attempts() < 10) {
+      exploration_bonus = 0.1;  // Moderate bonus for lightly tested nodes
     }
     
-    return std::max(0.0, success_rate - time_penalty);
+    // **TIME PENALTY: Recent failures are more important**
+    double time_penalty = 0.0;
+    if (failure_count > 0 && (td::Timestamp::now().at() - last_failure.at()) < 600.0) {
+      time_penalty = 0.2;
+      // Less penalty for "archive not found" (data availability issue)
+      if (archive_not_found_count > failure_count * 0.8) {
+        time_penalty *= 0.5;
+      }
+    }
+    
+    // **SPEED BONUS: Faster nodes get slight preference**
+    double speed_bonus = 0.0;
+    if (success_count > 0 && avg_speed > 0) {
+      speed_bonus = std::min(0.1, avg_speed / 10000000.0);  // Up to 0.1 bonus for 10MB/s+
+    }
+    
+    return std::max(0.0, std::min(1.0, base_score + exploration_bonus - time_penalty + speed_bonus));
   }
   
   bool is_blacklisted() const {
-    // **NEW: Shorter blacklist for "archive not found" dominant failures**
+    // **MORE FORGIVING: Only blacklist consistently failing nodes**
+    if (failure_count < 5) return false;  // Need at least 5 failures
+    if (success_count * 3 > failure_count) return false;  // Don't blacklist if success rate > 25%
+    
     double blacklist_time = 900.0;  // Default 15 minutes
     if (archive_not_found_count > failure_count * 0.7) {
       blacklist_time = 300.0;  // Only 5 minutes for data availability issues
     }
     
-    return failure_count >= 3 && (td::Timestamp::now().at() - last_failure.at()) < blacklist_time;
+    return (td::Timestamp::now().at() - last_failure.at()) < blacklist_time;
   }
 };
-
-// **NEW: Archive availability tracking**
-struct ArchiveAvailability {
-  td::uint32 attempt_count = 0;
-  td::uint32 not_found_count = 0;
-  td::Timestamp first_attempt;
-  td::Timestamp last_attempt;
-  
-  bool is_likely_unavailable() const {
-    // If 80% of attempts failed with "not found" and we've tried at least 5 times
-    return attempt_count >= 5 && not_found_count > attempt_count * 0.8;
-  }
-  
-  double get_retry_delay() const {
-    if (!is_likely_unavailable()) return 0.0;
-    
-    // Progressive delay: 30s, 1min, 2min, 5min, 10min (max)
-    double base_delay = 30.0;
-    td::uint32 retry_factor = std::min(attempt_count / 5, 10u);
-    return base_delay * (1 << retry_factor);  // Exponential backoff, capped at 10min
-  }
-};
-
-// Static archive availability tracking
-static std::map<std::pair<BlockSeqno, ShardIdFull>, ArchiveAvailability> archive_availability_;
 
 // Static node quality tracking (shared across instances)
 static std::map<adnl::AdnlNodeIdShort, NodeQuality> node_qualities_;
@@ -131,54 +149,6 @@ void DownloadArchiveSlice::abort_query(td::Status reason) {
 }
 
 void DownloadArchiveSlice::alarm() {
-  // **NEW: Check if we're in a delayed retry state**
-  auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
-  auto it = archive_availability_.find(archive_key);
-  
-  if (it != archive_availability_.end() && it->second.is_likely_unavailable()) {
-    // We were waiting for retry delay, now continue with normal flow
-    LOG(INFO) << "🔄 Retry delay expired for archive slice #" << masterchain_seqno_ 
-              << " " << shard_prefix_.to_str() << ", attempting download";
-    
-    // Reset timeout for actual download (original timeout from constructor)
-    alarm_timestamp() = timeout_;
-    
-    // Continue with the normal download flow
-    auto R = td::mkstemp(tmp_dir_);
-    if (R.is_error()) {
-      abort_query(R.move_as_error_prefix("failed to open temp file: "));
-      return;
-    }
-    auto r = R.move_as_ok();
-    fd_ = std::move(r.first);
-    tmp_name_ = std::move(r.second);
-
-    if (download_from_.is_zero() && client_.empty()) {
-      auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), this](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
-        if (R.is_error()) {
-          td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query, R.move_as_error());
-        } else {
-          auto vec = R.move_as_ok();
-          if (vec.size() == 0) {
-            td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query,
-                                    td::Status::Error(ErrorCode::notready, "no nodes"));
-          } else {
-            // Simplified node selection for alarm retry
-            LOG(INFO) << "🔄 Using first available node from " << vec.size() << " candidates (delayed retry)";
-            td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, vec[0]);
-          }
-        }
-      });
-
-      td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 6,
-                              std::move(P));
-    } else {
-      got_node_to_download(download_from_);
-    }
-    return;
-  }
-  
-  // Original timeout behavior
   abort_query(td::Status::Error(ErrorCode::timeout, "timeout"));
 }
 
@@ -187,21 +157,31 @@ void DownloadArchiveSlice::finish_query() {
     LOG(INFO) << "✅ Successfully downloaded archive slice #" << masterchain_seqno_ 
               << " " << shard_prefix_.to_str() << ": " << td::format::as_size(offset_);
     
-    // Update node quality on success
+    // **ENHANCED: Update node quality with detailed statistics**
     if (!download_from_.is_zero()) {
       auto& quality = node_qualities_[download_from_];
       quality.success_count++;
       quality.last_success = td::Timestamp::now();
-      LOG(INFO) << "✅ Node " << download_from_ << " success, score=" << quality.get_score();
-    }
-    
-    // **NEW: Reset archive availability statistics on success**
-    auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
-    auto it = archive_availability_.find(archive_key);
-    if (it != archive_availability_.end()) {
-      LOG(INFO) << "🔄 Archive slice #" << masterchain_seqno_ << " " << shard_prefix_.to_str() 
-                << " confirmed available, resetting statistics";
-      archive_availability_.erase(it);  // Remove from tracking since it's proven available
+      
+      // **NEW: Calculate and update download speed**
+      double download_time = prev_logged_timer_.elapsed() > 0 ? prev_logged_timer_.elapsed() : 1.0;
+      double current_speed = static_cast<double>(offset_) / download_time;  // bytes per second
+      
+      if (quality.success_count == 1) {
+        quality.avg_speed = current_speed;
+        quality.total_download_time = download_time;
+      } else {
+        // Update running average speed
+        quality.total_download_time += download_time;
+        quality.avg_speed = (quality.avg_speed * (quality.success_count - 1) + current_speed) / quality.success_count;
+      }
+      
+      LOG(INFO) << "✅ Node " << download_from_ << " SUCCESS"
+                << " | Score: " << quality.get_score()
+                << " | Success Rate: " << (quality.success_rate() * 100) << "%"
+                << " | Attempts: " << quality.total_attempts()
+                << " | Speed: " << td::format::as_size(static_cast<td::uint64>(current_speed)) << "/s"
+                << " | Avg Speed: " << td::format::as_size(static_cast<td::uint64>(quality.avg_speed)) << "/s";
     }
     
     promise_.set_value(std::move(tmp_name_));
@@ -211,33 +191,106 @@ void DownloadArchiveSlice::finish_query() {
   stop();
 }
 
-// Helper function to select best nodes
+// Helper function to select best nodes with explore-exploit strategy
 std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::AdnlNodeIdShort>& nodes, td::uint32 count) {
+  if (nodes.empty()) return {};
+  
   std::vector<std::pair<double, adnl::AdnlNodeIdShort>> scored_nodes;
+  td::uint32 new_nodes = 0;
+  td::uint32 experienced_nodes = 0;
+  td::uint32 blacklisted_nodes = 0;
   
   for (auto& node : nodes) {
     auto it = node_qualities_.find(node);
-    double score;
     
     if (it == node_qualities_.end()) {
-      score = 0.5;  // Neutral score for unknown nodes
+      // **EXPLORATION: New unknown nodes get high priority**
+      scored_nodes.emplace_back(0.8, node);  // High score for exploration
+      new_nodes++;
+      
+      // **NEW: Initialize tracking for new node (only once)**
+      auto& quality = node_qualities_[node];
+      if (quality.first_seen.at() == 0.0) {  // Only initialize if not already done
+        quality.first_seen = td::Timestamp::now();
+        LOG(INFO) << "🆕 Discovered new node " << node << " (total new: " << new_nodes << ")";
+      }
+      
     } else {
       if (it->second.is_blacklisted()) {
+        blacklisted_nodes++;
         continue;  // Skip blacklisted nodes
       }
-      score = it->second.get_score();
+      
+      double score = it->second.get_score();
+      scored_nodes.emplace_back(score, node);
+      
+      if (it->second.is_new_node()) {
+        new_nodes++;
+      } else {
+        experienced_nodes++;
+      }
     }
-    
-    scored_nodes.emplace_back(score, node);
   }
   
-  // Sort by score (descending)
+  // **SMART SELECTION STRATEGY**
   std::sort(scored_nodes.begin(), scored_nodes.end(), 
             [](const auto& a, const auto& b) { return a.first > b.first; });
   
   std::vector<adnl::AdnlNodeIdShort> result;
-  for (td::uint32 i = 0; i < std::min(count, static_cast<td::uint32>(scored_nodes.size())); i++) {
+  td::uint32 selected_count = std::min(count, static_cast<td::uint32>(scored_nodes.size()));
+  
+  if (scored_nodes.empty()) {
+    LOG(WARNING) << "❌ No available nodes (blacklisted: " << blacklisted_nodes << ")";
+    return result;
+  }
+  
+  // **ADAPTIVE EXPLORATION RATE**
+  double exploration_rate = 0.2;  // Base 20% exploration
+  if (new_nodes > experienced_nodes) {
+    exploration_rate = 0.4;  // More exploration when many new nodes available
+  } else if (experienced_nodes > 10) {
+    exploration_rate = 0.1;  // Less exploration when we have many experienced nodes
+  }
+  
+  td::uint32 explore_slots = static_cast<td::uint32>(selected_count * exploration_rate);
+  td::uint32 exploit_slots = selected_count - explore_slots;
+  
+  LOG(INFO) << "🎯 Node selection strategy - New: " << new_nodes 
+            << ", Experienced: " << experienced_nodes 
+            << ", Blacklisted: " << blacklisted_nodes
+            << " | Exploit: " << exploit_slots << ", Explore: " << explore_slots;
+  
+  // **EXPLOITATION: Select best performing nodes first**
+  for (td::uint32 i = 0; i < std::min(exploit_slots, static_cast<td::uint32>(scored_nodes.size())); i++) {
     result.push_back(scored_nodes[i].second);
+    auto it = node_qualities_.find(scored_nodes[i].second);
+    if (it != node_qualities_.end()) {
+      LOG(INFO) << "✅ Selected EXPLOIT node " << scored_nodes[i].second 
+                << " (score=" << scored_nodes[i].first 
+                << ", success_rate=" << it->second.success_rate() 
+                << ", attempts=" << it->second.total_attempts() << ")";
+    }
+  }
+  
+  // **EXPLORATION: Randomly select from remaining nodes for exploration**
+  if (explore_slots > 0 && scored_nodes.size() > exploit_slots) {
+    std::vector<std::pair<double, adnl::AdnlNodeIdShort>> exploration_candidates;
+    for (td::uint32 i = exploit_slots; i < scored_nodes.size(); i++) {
+      exploration_candidates.push_back(scored_nodes[i]);
+    }
+    
+    // Shuffle exploration candidates to add randomness
+    for (td::uint32 i = 0; i < std::min(explore_slots, static_cast<td::uint32>(exploration_candidates.size())); i++) {
+      td::uint32 random_idx = td::Random::fast(0, static_cast<td::int32>(exploration_candidates.size() - 1));
+      result.push_back(exploration_candidates[random_idx].second);
+      
+      auto it = node_qualities_.find(exploration_candidates[random_idx].second);
+      LOG(INFO) << "🔍 Selected EXPLORE node " << exploration_candidates[random_idx].second 
+                << " (score=" << exploration_candidates[random_idx].first 
+                << ", attempts=" << (it != node_qualities_.end() ? it->second.total_attempts() : 0) << ")";
+      
+      exploration_candidates.erase(exploration_candidates.begin() + random_idx);
+    }
   }
   
   return result;
@@ -245,29 +298,6 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
 
 void DownloadArchiveSlice::start_up() {
   alarm_timestamp() = timeout_;
-
-  // **NEW: Check archive availability and implement smart retry delay**
-  auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
-  auto& availability = archive_availability_[archive_key];
-  
-  if (availability.is_likely_unavailable()) {
-    double delay = availability.get_retry_delay();
-    LOG(WARNING) << "🕒 Archive slice #" << masterchain_seqno_ << " " << shard_prefix_.to_str() 
-                 << " appears unavailable (attempts: " << availability.attempt_count 
-                 << ", not found: " << availability.not_found_count 
-                 << "). Delaying retry for " << delay << "s";
-    
-    // Delay the retry - use relative time from now
-    alarm_timestamp() = td::Timestamp::in(delay);
-    return;
-  }
-  
-  // Update attempt statistics
-  availability.attempt_count++;
-  availability.last_attempt = td::Timestamp::now();
-  if (availability.first_attempt.at() == 0.0) {
-    availability.first_attempt = td::Timestamp::now();
-  }
 
   auto R = td::mkstemp(tmp_dir_);
   if (R.is_error()) {
@@ -279,8 +309,7 @@ void DownloadArchiveSlice::start_up() {
   tmp_name_ = std::move(r.second);
 
   LOG(INFO) << "📦 Starting optimized download of archive slice #" << masterchain_seqno_ 
-            << " " << shard_prefix_.to_str() 
-            << " (attempt " << availability.attempt_count << ")";
+            << " " << shard_prefix_.to_str();
 
   if (download_from_.is_zero() && client_.empty()) {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), this](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
@@ -292,10 +321,10 @@ void DownloadArchiveSlice::start_up() {
           td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query,
                                   td::Status::Error(ErrorCode::notready, "no nodes"));
         } else {
-          // **OPTIMIZATION: Select best nodes instead of random**
+          // **ENHANCED: Smart explore-exploit node selection**
           auto best_nodes = select_best_nodes(vec, std::min(static_cast<td::uint32>(vec.size()), static_cast<td::uint32>(3)));
           if (!best_nodes.empty()) {
-            LOG(INFO) << "🔍 Selected best node from " << vec.size() << " candidates";
+            LOG(INFO) << "🎯 Smart selection completed from " << vec.size() << " candidates, chose: " << best_nodes[0];
             td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, best_nodes[0]);
           } else {
             // **NEW: If all nodes are blacklisted, request more nodes**
@@ -335,12 +364,27 @@ void DownloadArchiveSlice::got_node_to_download(adnl::AdnlNodeIdShort download_f
   download_from_ = download_from;
   active_attempts_.insert(download_from);
 
-  // **OPTIMIZATION: Check if node is blacklisted**
+  // **ENHANCED: Check if node is blacklisted with detailed info**
   auto it = node_qualities_.find(download_from);
   if (it != node_qualities_.end() && it->second.is_blacklisted()) {
-    LOG(WARNING) << "❌ Node " << download_from << " is blacklisted, aborting";
+    LOG(WARNING) << "❌ Node " << download_from << " is BLACKLISTED"
+                 << " | Score: " << it->second.get_score()
+                 << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+                 << " | Attempts: " << it->second.total_attempts()
+                 << " | Recent Failures: " << it->second.failure_count;
     abort_query(td::Status::Error(ErrorCode::notready, "node blacklisted"));
     return;
+  }
+
+  // **NEW: Log node selection details**
+  if (it != node_qualities_.end()) {
+    LOG(INFO) << "🚀 Using node " << download_from 
+              << " | Score: " << it->second.get_score()
+              << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+              << " | Attempts: " << it->second.total_attempts()
+              << " | Type: " << (it->second.is_new_node() ? "NEW" : "EXPERIENCED");
+  } else {
+    LOG(INFO) << "🆕 Using completely unknown node " << download_from;
   }
 
   auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
@@ -372,11 +416,15 @@ void DownloadArchiveSlice::got_node_to_download(adnl::AdnlNodeIdShort download_f
 void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
   auto F = fetch_tl_object<ton_api::tonNode_ArchiveInfo>(std::move(data), true);
   if (F.is_error()) {
-    // **OPTIMIZATION: Track node failure**
+    // **ENHANCED: Track node failure with detailed statistics**
     auto& quality = node_qualities_[download_from_];
     quality.failure_count++;
     quality.last_failure = td::Timestamp::now();
-    LOG(WARNING) << "❌ Node " << download_from_ << " failed to parse ArchiveInfo, score=" << quality.get_score();
+    
+    LOG(WARNING) << "❌ Node " << download_from_ << " FAILED to parse ArchiveInfo"
+                 << " | Score: " << quality.get_score()
+                 << " | Success Rate: " << (quality.success_rate() * 100) << "%"
+                 << " | Attempts: " << quality.total_attempts();
     
     abort_query(F.move_as_error_prefix("failed to parse ArchiveInfo answer"));
     return;
@@ -386,20 +434,17 @@ void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
   bool fail = false;
   ton_api::downcast_call(*f.get(), td::overloaded(
                                        [&](const ton_api::tonNode_archiveNotFound &obj) {
-                                         // **OPTIMIZATION: Track node failure**
+                                         // **ENHANCED: Track specific failure type**
                                          auto& quality = node_qualities_[download_from_];
                                          quality.failure_count++;
                                          quality.last_failure = td::Timestamp::now();
                                          quality.archive_not_found_count++;
                                          
-                                         // **NEW: Update archive availability statistics**
-                                         auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
-                                         auto& availability = archive_availability_[archive_key];
-                                         availability.not_found_count++;
-                                         
-                                         LOG(WARNING) << "❌ Node " << download_from_ << " archive not found, score=" << quality.get_score()
-                                                      << " (archive attempts: " << availability.attempt_count 
-                                                      << ", not found: " << availability.not_found_count << ")";
+                                         LOG(WARNING) << "❌ Node " << download_from_ << " ARCHIVE NOT FOUND"
+                                                      << " | Score: " << quality.get_score()
+                                                      << " | Success Rate: " << (quality.success_rate() * 100) << "%"
+                                                      << " | Attempts: " << quality.total_attempts()
+                                                      << " | NotFound: " << quality.archive_not_found_count;
                                          
                                          abort_query(td::Status::Error(ErrorCode::notready, "remote db not found"));
                                          fail = true;
@@ -409,7 +454,8 @@ void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
     return;
   }
 
-  prev_logged_timer_ = td::Timer();
+  // **NEW: Record download start time for speed calculation**
+  prev_logged_timer_ = td::Timer();  // Reset timer at start of actual download
   LOG(INFO) << "📦 Found archive info from " << download_from_ << ", starting download";
   get_archive_slice();
 }
