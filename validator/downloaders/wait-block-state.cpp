@@ -255,7 +255,7 @@ void WaitBlockState::apply() {
   }
   
   // **OPTIMIZATION: Cache validation to avoid redundant checks**
-  static std::map<std::pair<ton::Bits256, ton::Bits256>, bool> validation_cache;
+  static std::map<std::string, bool> validation_cache;
   static td::Timestamp last_cache_cleanup = td::Timestamp::now();
   
   // Cleanup cache every 5 minutes to prevent memory bloat
@@ -267,8 +267,8 @@ void WaitBlockState::apply() {
   }
   
   auto state_hash = prev_state_->root_hash();
-  auto block_hash = block_->root_hash();
-  auto cache_key = std::make_pair(state_hash.bits(), block_hash.bits());
+  auto block_hash = block_->block_id().root_hash;
+  auto cache_key = state_hash.to_hex() + ":" + block_hash.to_hex();
   
   // **OPTIMIZATION: Skip re-validation if already validated this combination**
   bool is_cached = validation_cache.find(cache_key) != validation_cache.end();

@@ -111,7 +111,6 @@ struct NodeQuality {
 // Static node quality tracking (shared across instances)
 static std::map<adnl::AdnlNodeIdShort, NodeQuality> node_qualities_;
 static std::set<adnl::AdnlNodeIdShort> active_attempts_;
-static td::uint32 strategy_attempt_ = 0;
 
 // **ENHANCED: Block-level data availability tracking**
 struct BlockAvailability {
@@ -219,7 +218,6 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
   std::vector<std::pair<double, adnl::AdnlNodeIdShort>> new_nodes;
   
   td::uint32 new_count = 0;
-  td::uint32 experienced_count = 0;
   td::uint32 blacklisted_count = 0;
   td::uint32 high_quality_count = 0;
   
@@ -281,8 +279,6 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
       
       if (it->second.is_new_node()) {
         new_count++;
-      } else {
-        experienced_count++;
       }
     }
   }

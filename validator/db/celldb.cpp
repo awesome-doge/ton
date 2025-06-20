@@ -787,7 +787,6 @@ void CellDbIn::migrate_cells() {
   
   // **OPTIMIZATION: Dynamic batch size based on performance**
   static td::uint32 optimal_batch_size = 128;
-  static double last_migration_time = 1.0;
   
   // Adjust batch size based on previous performance
   if (migration_stats_->batches_ > 0) {
@@ -827,7 +826,6 @@ void CellDbIn::migrate_cells() {
   td::actor::send_closure(parent_, &CellDb::update_snapshot, cell_db_->snapshot());
 
   double time = timer.elapsed();
-  last_migration_time = time;
   LOG(DEBUG) << "CellDb migration: migrated=" << migrated << " checked=" << checked << " time=" << time 
              << " batch_size=" << current_batch_size << " optimal_batch_size=" << optimal_batch_size;
   ++migration_stats_->batches_;
