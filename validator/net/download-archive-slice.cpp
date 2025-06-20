@@ -19,6 +19,10 @@
 #include "download-archive-slice.hpp"
 #include "td/utils/port/path.h"
 #include "td/utils/overloaded.h"
+#include "td/utils/Random.h"
+#include <algorithm>
+#include <map>
+#include <set>
 
 #include <ton/ton-tl.hpp>
 
@@ -27,6 +31,31 @@ namespace ton {
 namespace validator {
 
 namespace fullnode {
+
+// Node quality tracking structure
+struct NodeQuality {
+  td::uint32 success_count = 0;
+  td::uint32 failure_count = 0;
+  td::Timestamp last_success;
+  td::Timestamp last_failure;
+  double avg_speed = 0.0;
+  
+  double get_score() const {
+    if (success_count + failure_count == 0) return 0.5;
+    double success_rate = double(success_count) / (success_count + failure_count);
+    double time_penalty = last_failure.is_in_past(600.0) ? 0.0 : 0.3;
+    return std::max(0.0, success_rate - time_penalty);
+  }
+  
+  bool is_blacklisted() const {
+    return failure_count >= 3 && !last_failure.is_in_past(900.0);  // 15min blacklist
+  }
+};
+
+// Static node quality tracking (shared across instances)
+static std::map<adnl::AdnlNodeIdShort, NodeQuality> node_qualities_;
+static std::set<adnl::AdnlNodeIdShort> active_attempts_;
+static td::uint32 strategy_attempt_ = 0;
 
 DownloadArchiveSlice::DownloadArchiveSlice(
     BlockSeqno masterchain_seqno, ShardIdFull shard_prefix, std::string tmp_dir, adnl::AdnlNodeIdShort local_id,
@@ -51,12 +80,15 @@ DownloadArchiveSlice::DownloadArchiveSlice(
 
 void DownloadArchiveSlice::abort_query(td::Status reason) {
   if (promise_) {
+    LOG(WARNING) << "🚫 Failed to download archive slice #" << masterchain_seqno_ 
+                 << " for shard " << shard_prefix_.to_str() << ": " << reason;
     promise_.set_error(std::move(reason));
     if (!fd_.empty()) {
       td::unlink(tmp_name_).ensure();
       fd_.close();
     }
   }
+  active_attempts_.erase(download_from_);
   stop();
 }
 
@@ -66,10 +98,54 @@ void DownloadArchiveSlice::alarm() {
 
 void DownloadArchiveSlice::finish_query() {
   if (promise_) {
+    LOG(INFO) << "✅ Successfully downloaded archive slice #" << masterchain_seqno_ 
+              << " " << shard_prefix_.to_str() << ": " << td::format::as_size(offset_);
+    
+    // Update node quality on success
+    if (!download_from_.is_zero()) {
+      auto& quality = node_qualities_[download_from_];
+      quality.success_count++;
+      quality.last_success = td::Timestamp::now();
+      LOG(INFO) << "✅ Node " << download_from_ << " success, score=" << quality.get_score();
+    }
+    
     promise_.set_value(std::move(tmp_name_));
     fd_.close();
   }
+  active_attempts_.erase(download_from_);
   stop();
+}
+
+// Helper function to select best nodes
+std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::AdnlNodeIdShort>& nodes, td::uint32 count) {
+  std::vector<std::pair<double, adnl::AdnlNodeIdShort>> scored_nodes;
+  
+  for (auto& node : nodes) {
+    auto it = node_qualities_.find(node);
+    double score;
+    
+    if (it == node_qualities_.end()) {
+      score = 0.5;  // Neutral score for unknown nodes
+    } else {
+      if (it->second.is_blacklisted()) {
+        continue;  // Skip blacklisted nodes
+      }
+      score = it->second.get_score();
+    }
+    
+    scored_nodes.emplace_back(score, node);
+  }
+  
+  // Sort by score (descending)
+  std::sort(scored_nodes.begin(), scored_nodes.end(), 
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+  
+  std::vector<adnl::AdnlNodeIdShort> result;
+  for (td::uint32 i = 0; i < std::min(count, td::uint32(scored_nodes.size())); i++) {
+    result.push_back(scored_nodes[i].second);
+  }
+  
+  return result;
 }
 
 void DownloadArchiveSlice::start_up() {
@@ -84,6 +160,9 @@ void DownloadArchiveSlice::start_up() {
   fd_ = std::move(r.first);
   tmp_name_ = std::move(r.second);
 
+  LOG(INFO) << "📦 Starting optimized download of archive slice #" << masterchain_seqno_ 
+            << " " << shard_prefix_.to_str();
+
   if (download_from_.is_zero() && client_.empty()) {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
       if (R.is_error()) {
@@ -94,12 +173,21 @@ void DownloadArchiveSlice::start_up() {
           td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query,
                                   td::Status::Error(ErrorCode::notready, "no nodes"));
         } else {
-          td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, vec[0]);
+          // **OPTIMIZATION: Select best nodes instead of random**
+          auto best_nodes = select_best_nodes(vec, std::min<td::uint32>(vec.size(), 3));
+          if (!best_nodes.empty()) {
+            LOG(INFO) << "🔍 Selected best node from " << vec.size() << " candidates";
+            td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, best_nodes[0]);
+          } else {
+            // Fallback to random if all nodes are blacklisted
+            td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, vec[0]);
+          }
         }
       }
     });
 
-    td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 1,
+    // **OPTIMIZATION: Request more nodes for better selection**
+    td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 6,
                             std::move(P));
   } else {
     got_node_to_download(download_from_);
@@ -108,6 +196,15 @@ void DownloadArchiveSlice::start_up() {
 
 void DownloadArchiveSlice::got_node_to_download(adnl::AdnlNodeIdShort download_from) {
   download_from_ = download_from;
+  active_attempts_.insert(download_from);
+
+  // **OPTIMIZATION: Check if node is blacklisted**
+  auto it = node_qualities_.find(download_from);
+  if (it != node_qualities_.end() && it->second.is_blacklisted()) {
+    LOG(WARNING) << "❌ Node " << download_from << " is blacklisted, aborting";
+    abort_query(td::Status::Error(ErrorCode::notready, "node blacklisted"));
+    return;
+  }
 
   auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
     if (R.is_error()) {
@@ -125,8 +222,9 @@ void DownloadArchiveSlice::got_node_to_download(adnl::AdnlNodeIdShort download_f
                                                                          create_tl_shard_id(shard_prefix_));
   }
   if (client_.empty()) {
+    // **OPTIMIZATION: Shorter timeout for faster failure detection**
     td::actor::send_closure(overlays_, &overlay::Overlays::send_query, download_from_, local_id_, overlay_id_,
-                            "get_archive_info", std::move(P), td::Timestamp::in(3.0), std::move(q));
+                            "get_archive_info", std::move(P), td::Timestamp::in(2.0), std::move(q));
   } else {
     td::actor::send_closure(client_, &adnl::AdnlExtClient::send_query, "get_archive_info",
                             create_serialize_tl_object_suffix<ton_api::tonNode_query>(std::move(q)),
@@ -137,6 +235,12 @@ void DownloadArchiveSlice::got_node_to_download(adnl::AdnlNodeIdShort download_f
 void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
   auto F = fetch_tl_object<ton_api::tonNode_ArchiveInfo>(std::move(data), true);
   if (F.is_error()) {
+    // **OPTIMIZATION: Track node failure**
+    auto& quality = node_qualities_[download_from_];
+    quality.failure_count++;
+    quality.last_failure = td::Timestamp::now();
+    LOG(WARNING) << "❌ Node " << download_from_ << " failed to parse ArchiveInfo, score=" << quality.get_score();
+    
     abort_query(F.move_as_error_prefix("failed to parse ArchiveInfo answer"));
     return;
   }
@@ -145,6 +249,12 @@ void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
   bool fail = false;
   ton_api::downcast_call(*f.get(), td::overloaded(
                                        [&](const ton_api::tonNode_archiveNotFound &obj) {
+                                         // **OPTIMIZATION: Track node failure**
+                                         auto& quality = node_qualities_[download_from_];
+                                         quality.failure_count++;
+                                         quality.last_failure = td::Timestamp::now();
+                                         LOG(WARNING) << "❌ Node " << download_from_ << " archive not found, score=" << quality.get_score();
+                                         
                                          abort_query(td::Status::Error(ErrorCode::notready, "remote db not found"));
                                          fail = true;
                                        },
@@ -154,8 +264,7 @@ void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
   }
 
   prev_logged_timer_ = td::Timer();
-  LOG(INFO) << "downloading archive slice #" << masterchain_seqno_ << " " << shard_prefix_.to_str() << " from "
-            << download_from_;
+  LOG(INFO) << "📦 Found archive info from " << download_from_ << ", starting download";
   get_archive_slice();
 }
 
@@ -170,13 +279,14 @@ void DownloadArchiveSlice::get_archive_slice() {
 
   auto q = create_serialize_tl_object<ton_api::tonNode_getArchiveSlice>(archive_id_, offset_, slice_size());
   if (client_.empty()) {
+    // **OPTIMIZATION: Longer timeout for actual data transfer**
     td::actor::send_closure(overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_, overlay_id_,
-                            "get_archive_slice", std::move(P), td::Timestamp::in(15.0), std::move(q),
+                            "get_archive_slice", std::move(P), td::Timestamp::in(25.0), std::move(q),
                             slice_size() + 1024, rldp_);
   } else {
     td::actor::send_closure(client_, &adnl::AdnlExtClient::send_query, "get_archive_slice",
                             create_serialize_tl_object_suffix<ton_api::tonNode_query>(std::move(q)),
-                            td::Timestamp::in(15.0), std::move(P));
+                            td::Timestamp::in(20.0), std::move(P));
   }
 }
 
@@ -193,18 +303,18 @@ void DownloadArchiveSlice::got_archive_slice(td::BufferSlice data) {
 
   offset_ += data.size();
 
+  // **OPTIMIZATION: Enhanced progress logging**
   double elapsed = prev_logged_timer_.elapsed();
-  if (elapsed > 10.0) {
+  if (elapsed > 3.0) {  // Log every 3 seconds
     prev_logged_timer_ = td::Timer();
-    LOG(INFO) << "downloading archive slice #" << masterchain_seqno_ << " " << shard_prefix_.to_str()
-              << ": total=" << offset_ << " ("
-              << td::format::as_size((td::uint64)(double(offset_ - prev_logged_sum_) / elapsed)) << "/s)";
+    auto speed = (offset_ - prev_logged_sum_) / elapsed;
+    LOG(INFO) << "⬇️  Downloading archive slice #" << masterchain_seqno_ 
+              << " " << shard_prefix_.to_str() << ": " << td::format::as_size(offset_)
+              << " (" << td::format::as_size(td::uint64(speed)) << "/s)";
     prev_logged_sum_ = offset_;
   }
 
   if (data.size() < slice_size()) {
-    LOG(INFO) << "finished downloading arcrive slice #" << masterchain_seqno_ << " " << shard_prefix_.to_str()
-              << ": total=" << offset_;
     finish_query();
   } else {
     get_archive_slice();
