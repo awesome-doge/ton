@@ -65,6 +65,31 @@ struct NodeQuality {
   }
 };
 
+// **NEW: Archive availability tracking**
+struct ArchiveAvailability {
+  td::uint32 attempt_count = 0;
+  td::uint32 not_found_count = 0;
+  td::Timestamp first_attempt;
+  td::Timestamp last_attempt;
+  
+  bool is_likely_unavailable() const {
+    // If 80% of attempts failed with "not found" and we've tried at least 5 times
+    return attempt_count >= 5 && not_found_count > attempt_count * 0.8;
+  }
+  
+  double get_retry_delay() const {
+    if (!is_likely_unavailable()) return 0.0;
+    
+    // Progressive delay: 30s, 1min, 2min, 5min, 10min (max)
+    double base_delay = 30.0;
+    td::uint32 retry_factor = std::min(attempt_count / 5, 10u);
+    return base_delay * (1 << retry_factor);  // Exponential backoff, capped at 10min
+  }
+};
+
+// Static archive availability tracking
+static std::map<std::pair<BlockSeqno, ShardIdFull>, ArchiveAvailability> archive_availability_;
+
 // Static node quality tracking (shared across instances)
 static std::map<adnl::AdnlNodeIdShort, NodeQuality> node_qualities_;
 static std::set<adnl::AdnlNodeIdShort> active_attempts_;
@@ -106,6 +131,54 @@ void DownloadArchiveSlice::abort_query(td::Status reason) {
 }
 
 void DownloadArchiveSlice::alarm() {
+  // **NEW: Check if we're in a delayed retry state**
+  auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
+  auto it = archive_availability_.find(archive_key);
+  
+  if (it != archive_availability_.end() && it->second.is_likely_unavailable()) {
+    // We were waiting for retry delay, now continue with normal flow
+    LOG(INFO) << "🔄 Retry delay expired for archive slice #" << masterchain_seqno_ 
+              << " " << shard_prefix_.to_str() << ", attempting download";
+    
+    // Reset timeout for actual download (original timeout from constructor)
+    alarm_timestamp() = timeout_;
+    
+    // Continue with the normal download flow
+    auto R = td::mkstemp(tmp_dir_);
+    if (R.is_error()) {
+      abort_query(R.move_as_error_prefix("failed to open temp file: "));
+      return;
+    }
+    auto r = R.move_as_ok();
+    fd_ = std::move(r.first);
+    tmp_name_ = std::move(r.second);
+
+    if (download_from_.is_zero() && client_.empty()) {
+      auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), this](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
+        if (R.is_error()) {
+          td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query, R.move_as_error());
+        } else {
+          auto vec = R.move_as_ok();
+          if (vec.size() == 0) {
+            td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query,
+                                    td::Status::Error(ErrorCode::notready, "no nodes"));
+          } else {
+            // Simplified node selection for alarm retry
+            LOG(INFO) << "🔄 Using first available node from " << vec.size() << " candidates (delayed retry)";
+            td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, vec[0]);
+          }
+        }
+      });
+
+      td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 6,
+                              std::move(P));
+    } else {
+      got_node_to_download(download_from_);
+    }
+    return;
+  }
+  
+  // Original timeout behavior
   abort_query(td::Status::Error(ErrorCode::timeout, "timeout"));
 }
 
@@ -120,6 +193,15 @@ void DownloadArchiveSlice::finish_query() {
       quality.success_count++;
       quality.last_success = td::Timestamp::now();
       LOG(INFO) << "✅ Node " << download_from_ << " success, score=" << quality.get_score();
+    }
+    
+    // **NEW: Reset archive availability statistics on success**
+    auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
+    auto it = archive_availability_.find(archive_key);
+    if (it != archive_availability_.end()) {
+      LOG(INFO) << "🔄 Archive slice #" << masterchain_seqno_ << " " << shard_prefix_.to_str() 
+                << " confirmed available, resetting statistics";
+      archive_availability_.erase(it);  // Remove from tracking since it's proven available
     }
     
     promise_.set_value(std::move(tmp_name_));
@@ -164,6 +246,29 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
 void DownloadArchiveSlice::start_up() {
   alarm_timestamp() = timeout_;
 
+  // **NEW: Check archive availability and implement smart retry delay**
+  auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
+  auto& availability = archive_availability_[archive_key];
+  
+  if (availability.is_likely_unavailable()) {
+    double delay = availability.get_retry_delay();
+    LOG(WARNING) << "🕒 Archive slice #" << masterchain_seqno_ << " " << shard_prefix_.to_str() 
+                 << " appears unavailable (attempts: " << availability.attempt_count 
+                 << ", not found: " << availability.not_found_count 
+                 << "). Delaying retry for " << delay << "s";
+    
+    // Delay the retry - use relative time from now
+    alarm_timestamp() = td::Timestamp::in(delay);
+    return;
+  }
+  
+  // Update attempt statistics
+  availability.attempt_count++;
+  availability.last_attempt = td::Timestamp::now();
+  if (availability.first_attempt.at() == 0.0) {
+    availability.first_attempt = td::Timestamp::now();
+  }
+
   auto R = td::mkstemp(tmp_dir_);
   if (R.is_error()) {
     abort_query(R.move_as_error_prefix("failed to open temp file: "));
@@ -174,7 +279,8 @@ void DownloadArchiveSlice::start_up() {
   tmp_name_ = std::move(r.second);
 
   LOG(INFO) << "📦 Starting optimized download of archive slice #" << masterchain_seqno_ 
-            << " " << shard_prefix_.to_str();
+            << " " << shard_prefix_.to_str() 
+            << " (attempt " << availability.attempt_count << ")";
 
   if (download_from_.is_zero() && client_.empty()) {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), this](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
@@ -285,7 +391,15 @@ void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
                                          quality.failure_count++;
                                          quality.last_failure = td::Timestamp::now();
                                          quality.archive_not_found_count++;
-                                         LOG(WARNING) << "❌ Node " << download_from_ << " archive not found, score=" << quality.get_score();
+                                         
+                                         // **NEW: Update archive availability statistics**
+                                         auto archive_key = std::make_pair(masterchain_seqno_, shard_prefix_);
+                                         auto& availability = archive_availability_[archive_key];
+                                         availability.not_found_count++;
+                                         
+                                         LOG(WARNING) << "❌ Node " << download_from_ << " archive not found, score=" << quality.get_score()
+                                                      << " (archive attempts: " << availability.attempt_count 
+                                                      << ", not found: " << availability.not_found_count << ")";
                                          
                                          abort_query(td::Status::Error(ErrorCode::notready, "remote db not found"));
                                          fail = true;
