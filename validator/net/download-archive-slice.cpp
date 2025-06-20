@@ -63,25 +63,25 @@ struct NodeQuality {
   }
   
   double get_score() const {
-    if (total_attempts() == 0) return 0.8;  // **HIGH score for completely unknown nodes**
+    if (total_attempts() == 0) return 0.3;  // **REDUCED: Lower score for completely unknown nodes**
     
     double base_score = success_rate();
     
-    // **EXPLORATION BONUS: Encourage trying new or rarely used nodes**
+    // **REDUCED EXPLORATION BONUS: Less aggressive exploration**
     double exploration_bonus = 0.0;
     if (is_new_node()) {
-      exploration_bonus = 0.3;  // Strong bonus for new nodes
+      exploration_bonus = 0.1;  // **REDUCED: Smaller bonus for new nodes**
     } else if (total_attempts() < 10) {
-      exploration_bonus = 0.1;  // Moderate bonus for lightly tested nodes
+      exploration_bonus = 0.05;  // **REDUCED: Smaller bonus for lightly tested nodes**
     }
     
-    // **TIME PENALTY: Recent failures are more important**
+    // **ENHANCED TIME PENALTY: Stronger penalty for recent failures**
     double time_penalty = 0.0;
     if (failure_count > 0 && (td::Timestamp::now().at() - last_failure.at()) < 600.0) {
-      time_penalty = 0.2;
-      // Less penalty for "archive not found" (data availability issue)
+      time_penalty = 0.4;  // **INCREASED: Stronger penalty for recent failures**
+      // **ENHANCED: Still penalize "archive not found" but less**
       if (archive_not_found_count > failure_count * 0.8) {
-        time_penalty *= 0.5;
+        time_penalty *= 0.7;  // **INCREASED: Less reduction for archive not found**
       }
     }
     
@@ -95,13 +95,13 @@ struct NodeQuality {
   }
   
   bool is_blacklisted() const {
-    // **MORE FORGIVING: Only blacklist consistently failing nodes**
-    if (failure_count < 5) return false;  // Need at least 5 failures
-    if (success_count * 3 > failure_count) return false;  // Don't blacklist if success rate > 25%
+    // **MORE AGGRESSIVE: Blacklist failing nodes faster**
+    if (failure_count < 3) return false;  // **REDUCED: Need only 3 failures instead of 5**
+    if (success_count * 2 > failure_count) return false;  // **STRICTER: Don't blacklist if success rate > 50% (was 25%)**
     
-    double blacklist_time = 900.0;  // Default 15 minutes
+    double blacklist_time = 1800.0;  // **INCREASED: Default 30 minutes (was 15)** 
     if (archive_not_found_count > failure_count * 0.7) {
-      blacklist_time = 300.0;  // Only 5 minutes for data availability issues
+      blacklist_time = 900.0;  // **INCREASED: 15 minutes for data availability issues (was 5)**
     }
     
     return (td::Timestamp::now().at() - last_failure.at()) < blacklist_time;
@@ -113,7 +113,7 @@ static std::map<adnl::AdnlNodeIdShort, NodeQuality> node_qualities_;
 static std::set<adnl::AdnlNodeIdShort> active_attempts_;
 static td::uint32 strategy_attempt_ = 0;
 
-// **NEW: Block-level data availability tracking**
+// **ENHANCED: Block-level data availability tracking**
 struct BlockAvailability {
   td::uint32 not_found_count = 0;
   td::uint32 total_attempts = 0;
@@ -121,15 +121,15 @@ struct BlockAvailability {
   td::Timestamp last_not_found;
   
   bool is_likely_unavailable() const {
-    if (total_attempts < 3) return false;  // Need some attempts first
+    if (total_attempts < 2) return false;  // **REDUCED: Need fewer attempts to trigger (was 3)**
     double not_found_rate = double(not_found_count) / total_attempts;
-    bool recent_failures = (td::Timestamp::now().at() - last_not_found.at()) < 300.0;  // 5min
-    return not_found_rate > 0.8 && recent_failures;  // 80%+ not found rate
+    bool recent_failures = (td::Timestamp::now().at() - last_not_found.at()) < 600.0;  // **INCREASED: 10min (was 5min)**
+    return not_found_rate > 0.6 && recent_failures;  // **REDUCED: 60%+ not found rate (was 80%)**
   }
   
   td::uint32 recommended_delay() const {
     if (!is_likely_unavailable()) return 0;
-    return std::min(300u, not_found_count * 30);  // Up to 5min delay, 30s per failure
+    return std::min(600u, not_found_count * 60);  // **INCREASED: Up to 10min delay, 60s per failure (was 30s)**
   }
 };
 
@@ -231,8 +231,8 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
     auto it = node_qualities_.find(node);
     
     if (it == node_qualities_.end()) {
-      // **EXPLORATION: New unknown nodes**
-      double new_node_score = 0.6;  // Moderate score for new nodes
+      // **REDUCED EXPLORATION: Lower score for new unknown nodes**
+      double new_node_score = 0.2;  // **REDUCED: Much lower score for new nodes**
       all_nodes.emplace_back(new_node_score, node);
       new_nodes.emplace_back(new_node_score, node);
       new_count++;
@@ -254,8 +254,8 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
       
       double score = it->second.get_score();
       
-      // **NEW: STRICT FILTERING - Skip very low quality nodes**
-      if (score < 0.1 && it->second.total_attempts() >= 2) {
+      // **STRICTER FILTERING: Skip more low quality nodes**
+      if (score < 0.2 && it->second.total_attempts() >= 2) {  // **INCREASED: Stricter threshold**
         blacklisted_count++;
         LOG(WARNING) << "🚫 Filtering low-quality node " << node 
                      << " | Score: " << score
@@ -266,14 +266,14 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
       
       all_nodes.emplace_back(score, node);
       
-      // **ENHANCED: Categorize nodes by quality with better logic**
-      if (it->second.success_rate() >= 0.7 && it->second.total_attempts() >= 2) {
+      // **ENHANCED: More strict categorization for better quality control**
+      if (it->second.success_rate() >= 0.8 && it->second.total_attempts() >= 3) {  // **STRICTER: Higher requirements**
         high_quality_nodes.emplace_back(score, node);
         high_quality_count++;
         LOG(INFO) << "⭐ High-quality node found: " << node 
                   << " (score=" << score << ", success_rate=" << (it->second.success_rate() * 100) << "%)";
-      } else if (it->second.is_new_node() || (score >= 0.3 && it->second.success_rate() >= 0.3)) {
-        // NEW: Only medium nodes if they have some success OR are new
+      } else if (it->second.is_new_node() || (score >= 0.4 && it->second.success_rate() >= 0.5)) {  // **STRICTER: Higher thresholds**
+        // Only medium nodes if they have decent success OR are new
         medium_nodes.emplace_back(score, node);
         LOG(INFO) << "🔶 Medium-quality node: " << node 
                   << " (score=" << score << ", success_rate=" << (it->second.success_rate() * 100) << "%)";
@@ -312,8 +312,8 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
     std::sort(high_quality_nodes.begin(), high_quality_nodes.end(), 
               [](const auto& a, const auto& b) { return a.first > b.first; });
     
-    // Select at least 60% from high-quality nodes
-    td::uint32 high_quality_slots = std::max(1u, static_cast<td::uint32>(selected_count * 0.6));
+    // **INCREASED: Select at least 80% from high-quality nodes (was 60%)**
+    td::uint32 high_quality_slots = std::max(1u, static_cast<td::uint32>(selected_count * 0.8));
     high_quality_slots = std::min(high_quality_slots, static_cast<td::uint32>(high_quality_nodes.size()));
     
     for (td::uint32 i = 0; i < high_quality_slots; i++) {
@@ -328,13 +328,21 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
     selected_count -= high_quality_slots;
   }
   
-  // **STRATEGY 2: FILL REMAINING SLOTS WITH EXPLORATION/MEDIUM NODES**
+  // **STRATEGY 2: PRIORITIZE MEDIUM NODES OVER NEW NODES**
   if (selected_count > 0) {
     std::vector<std::pair<double, adnl::AdnlNodeIdShort>> remaining_candidates;
     
-    // Combine medium and new nodes for remaining slots
+    // **CHANGED: Prioritize medium nodes first, then new nodes**
     remaining_candidates.insert(remaining_candidates.end(), medium_nodes.begin(), medium_nodes.end());
-    remaining_candidates.insert(remaining_candidates.end(), new_nodes.begin(), new_nodes.end());
+    
+    // **LIMIT NEW NODE EXPLORATION: Only add a few new nodes**
+    td::uint32 max_new_nodes = std::min(static_cast<td::uint32>(2), selected_count);  // **LIMIT: Max 2 new nodes**
+    td::uint32 added_new_nodes = 0;
+    for (auto& new_node : new_nodes) {
+      if (added_new_nodes >= max_new_nodes) break;
+      remaining_candidates.push_back(new_node);
+      added_new_nodes++;
+    }
     
     // Sort remaining candidates by score
     std::sort(remaining_candidates.begin(), remaining_candidates.end(), 
@@ -345,12 +353,12 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
       
       auto it = node_qualities_.find(remaining_candidates[i].second);
       if (it != node_qualities_.end()) {
-        LOG(INFO) << "🔍 EXPLORE SELECT: " << remaining_candidates[i].second 
+        LOG(INFO) << "🔍 MEDIUM SELECT: " << remaining_candidates[i].second 
                   << " | Score: " << remaining_candidates[i].first
                   << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
                   << " | Attempts: " << it->second.total_attempts();
       } else {
-        LOG(INFO) << "🆕 NEW NODE SELECT: " << remaining_candidates[i].second 
+        LOG(INFO) << "🆕 LIMITED NEW NODE SELECT: " << remaining_candidates[i].second 
                   << " | Score: " << remaining_candidates[i].first;
       }
     }
@@ -361,10 +369,10 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
     std::sort(all_nodes.begin(), all_nodes.end(), 
               [](const auto& a, const auto& b) { return a.first > b.first; });
     
-    // **NEW: Even in fallback, avoid the worst nodes**
+    // **STRICTER: Higher minimum score requirement**
     std::vector<std::pair<double, adnl::AdnlNodeIdShort>> acceptable_fallback;
     for (auto& node_pair : all_nodes) {
-      if (node_pair.first >= 0.1) {  // At least some minimal score
+      if (node_pair.first >= 0.3) {  // **INCREASED: At least 0.3 minimal score (was 0.1)**
         acceptable_fallback.push_back(node_pair);
       }
     }
@@ -373,12 +381,12 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
       result.push_back(acceptable_fallback[0].second);
       LOG(WARNING) << "⚠️ FALLBACK SELECT (acceptable): " << acceptable_fallback[0].second 
                    << " | Score: " << acceptable_fallback[0].first;
-    } else if (!all_nodes.empty()) {
-      // Last resort: pick best of the worst
-      result.push_back(all_nodes[0].second);
-      LOG(ERROR) << "🆘 LAST RESORT SELECT: " << all_nodes[0].second 
-                 << " | Score: " << all_nodes[0].first 
-                 << " | ALL NODES ARE LOW QUALITY!";
+    } else {
+      // **REMOVED: No more "last resort" selection of worst nodes**
+      LOG(ERROR) << "🚫 NO ACCEPTABLE NODES FOUND! All nodes have score < 0.3"
+                 << " | Best available score: " << (all_nodes.empty() ? 0.0 : all_nodes[0].first)
+                 << " | Refusing to use low-quality nodes";
+      // Don't select any node - let the system request new nodes instead
     }
   }
   
@@ -434,8 +442,8 @@ void DownloadArchiveSlice::start_up() {
     }
     
     if (!known_good_nodes.empty()) {
-      // **NEW: 80% use known good nodes, 20% explore new nodes**
-      bool use_known_node = (td::Random::fast(1, 100) <= 80);  // 80% probability
+      // **CHANGED: 90% use known good nodes, 10% explore new nodes (was 80%/20%)**
+      bool use_known_node = (td::Random::fast(1, 100) <= 90);  // **INCREASED: 90% probability**
       
       if (use_known_node) {
         // Sort by score and pick the best
@@ -446,7 +454,7 @@ void DownloadArchiveSlice::start_up() {
                     return it_a->second.get_score() > it_b->second.get_score();
                   });
         
-        // **NEW: Add some randomness among top nodes to avoid overusing single node**
+        // **ENHANCED: Add some randomness among top nodes to avoid overusing single node**
         td::uint32 top_nodes_count = std::min(3u, static_cast<td::uint32>(known_good_nodes.size()));
         td::uint32 selected_idx = td::Random::fast(0, static_cast<td::int32>(top_nodes_count - 1));
         
@@ -462,7 +470,7 @@ void DownloadArchiveSlice::start_up() {
         return;
       } else {
         LOG(INFO) << "🎲 EXPLORATION MODE: Skipping " << known_good_nodes.size() 
-                  << " known good nodes to explore new options";
+                  << " known good nodes to explore new options (10% chance)";
       }
     } else {
       LOG(INFO) << "🔍 No known high-quality nodes available, requesting from overlay...";
@@ -598,16 +606,29 @@ void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
                                          quality.last_failure = td::Timestamp::now();
                                          quality.archive_not_found_count++;
                                          
+                                         // **NEW: Update block-level availability tracking**
+                                         auto& block_avail = block_availability_[masterchain_seqno_];
+                                         block_avail.total_attempts++;
+                                         block_avail.not_found_count++;
+                                         block_avail.last_not_found = td::Timestamp::now();
+                                         
                                          LOG(WARNING) << "❌ Node " << download_from_ << " ARCHIVE NOT FOUND"
                                                       << " | Score: " << quality.get_score()
                                                       << " | Success Rate: " << (quality.success_rate() * 100) << "%"
                                                       << " | Attempts: " << quality.total_attempts()
-                                                      << " | NotFound: " << quality.archive_not_found_count;
+                                                      << " | NotFound: " << quality.archive_not_found_count
+                                                      << " | Block NotFound Rate: " << (double(block_avail.not_found_count) / block_avail.total_attempts * 100) << "%";
                                          
                                          abort_query(td::Status::Error(ErrorCode::notready, "remote db not found"));
                                          fail = true;
                                        },
-                                       [&](const ton_api::tonNode_archiveInfo &obj) { archive_id_ = obj.id_; }));
+                                       [&](const ton_api::tonNode_archiveInfo &obj) { 
+                                         archive_id_ = obj.id_;
+                                         
+                                         // **NEW: Update block-level availability tracking for success**
+                                         auto& block_avail = block_availability_[masterchain_seqno_];
+                                         block_avail.total_attempts++;
+                                       }));
   if (fail) {
     return;
   }
