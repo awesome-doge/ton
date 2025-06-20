@@ -253,16 +253,34 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
       }
       
       double score = it->second.get_score();
+      
+      // **NEW: STRICT FILTERING - Skip very low quality nodes**
+      if (score < 0.1 && it->second.total_attempts() >= 2) {
+        blacklisted_count++;
+        LOG(WARNING) << "🚫 Filtering low-quality node " << node 
+                     << " | Score: " << score
+                     << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+                     << " | Attempts: " << it->second.total_attempts();
+        continue;  // Skip very low quality nodes
+      }
+      
       all_nodes.emplace_back(score, node);
       
-      // **NEW: Categorize nodes by quality**
+      // **ENHANCED: Categorize nodes by quality with better logic**
       if (it->second.success_rate() >= 0.7 && it->second.total_attempts() >= 2) {
         high_quality_nodes.emplace_back(score, node);
         high_quality_count++;
         LOG(INFO) << "⭐ High-quality node found: " << node 
                   << " (score=" << score << ", success_rate=" << (it->second.success_rate() * 100) << "%)";
-      } else if (score >= 0.3 || it->second.is_new_node()) {
+      } else if (it->second.is_new_node() || (score >= 0.3 && it->second.success_rate() >= 0.3)) {
+        // NEW: Only medium nodes if they have some success OR are new
         medium_nodes.emplace_back(score, node);
+        LOG(INFO) << "🔶 Medium-quality node: " << node 
+                  << " (score=" << score << ", success_rate=" << (it->second.success_rate() * 100) << "%)";
+      } else {
+        // **NEW: Log nodes that are being filtered out**
+        LOG(INFO) << "🔻 Low-quality node available but deprioritized: " << node 
+                  << " (score=" << score << ", success_rate=" << (it->second.success_rate() * 100) << "%)";
       }
       
       if (it->second.is_new_node()) {
@@ -342,9 +360,30 @@ std::vector<adnl::AdnlNodeIdShort> select_best_nodes(const std::vector<adnl::Adn
   if (result.empty() && !all_nodes.empty()) {
     std::sort(all_nodes.begin(), all_nodes.end(), 
               [](const auto& a, const auto& b) { return a.first > b.first; });
-    result.push_back(all_nodes[0].second);
-    LOG(WARNING) << "⚠️ FALLBACK SELECT: " << all_nodes[0].second 
-                 << " | Score: " << all_nodes[0].first;
+    
+    // **NEW: Even in fallback, avoid the worst nodes**
+    std::vector<std::pair<double, adnl::AdnlNodeIdShort>> acceptable_fallback;
+    for (auto& node_pair : all_nodes) {
+      if (node_pair.first >= 0.1) {  // At least some minimal score
+        acceptable_fallback.push_back(node_pair);
+      }
+    }
+    
+    if (!acceptable_fallback.empty()) {
+      result.push_back(acceptable_fallback[0].second);
+      LOG(WARNING) << "⚠️ FALLBACK SELECT (acceptable): " << acceptable_fallback[0].second 
+                   << " | Score: " << acceptable_fallback[0].first;
+    } else if (!all_nodes.empty()) {
+      // Last resort: pick best of the worst
+      result.push_back(all_nodes[0].second);
+      LOG(ERROR) << "🆘 LAST RESORT SELECT: " << all_nodes[0].second 
+                 << " | Score: " << all_nodes[0].first 
+                 << " | ALL NODES ARE LOW QUALITY!";
+    }
+  }
+  
+  if (result.empty()) {
+    LOG(ERROR) << "💥 NO NODES SELECTED! This should not happen!";
   }
   
   return result;
@@ -384,6 +423,51 @@ void DownloadArchiveSlice::start_up() {
             << " " << shard_prefix_.to_str();
 
   if (download_from_.is_zero() && client_.empty()) {
+    // **NEW: First try to use known high-quality nodes**
+    std::vector<adnl::AdnlNodeIdShort> known_good_nodes;
+    for (auto& pair : node_qualities_) {
+      if (!pair.second.is_blacklisted() && 
+          pair.second.success_rate() >= 0.7 && 
+          pair.second.total_attempts() >= 2) {
+        known_good_nodes.push_back(pair.first);
+      }
+    }
+    
+    if (!known_good_nodes.empty()) {
+      // **NEW: 80% use known good nodes, 20% explore new nodes**
+      bool use_known_node = (td::Random::fast(1, 100) <= 80);  // 80% probability
+      
+      if (use_known_node) {
+        // Sort by score and pick the best
+        std::sort(known_good_nodes.begin(), known_good_nodes.end(), 
+                  [](const adnl::AdnlNodeIdShort& a, const adnl::AdnlNodeIdShort& b) {
+                    auto it_a = node_qualities_.find(a);
+                    auto it_b = node_qualities_.find(b);
+                    return it_a->second.get_score() > it_b->second.get_score();
+                  });
+        
+        // **NEW: Add some randomness among top nodes to avoid overusing single node**
+        td::uint32 top_nodes_count = std::min(3u, static_cast<td::uint32>(known_good_nodes.size()));
+        td::uint32 selected_idx = td::Random::fast(0, static_cast<td::int32>(top_nodes_count - 1));
+        
+        auto best_known = known_good_nodes[selected_idx];
+        auto it = node_qualities_.find(best_known);
+        LOG(INFO) << "🏆 PRIORITIZING known high-quality node: " << best_known
+                  << " | Score: " << it->second.get_score()
+                  << " | Success Rate: " << (it->second.success_rate() * 100) << "%"
+                  << " | Attempts: " << it->second.total_attempts()
+                  << " | Rank: " << (selected_idx + 1) << "/" << known_good_nodes.size();
+        
+        got_node_to_download(best_known);
+        return;
+      } else {
+        LOG(INFO) << "🎲 EXPLORATION MODE: Skipping " << known_good_nodes.size() 
+                  << " known good nodes to explore new options";
+      }
+    } else {
+      LOG(INFO) << "🔍 No known high-quality nodes available, requesting from overlay...";
+    }
+
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), this](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
       if (R.is_error()) {
         td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query, R.move_as_error());
@@ -394,13 +478,15 @@ void DownloadArchiveSlice::start_up() {
                                   td::Status::Error(ErrorCode::notready, "no nodes"));
         } else {
           // **ENHANCED: Smart explore-exploit node selection**
+          LOG(INFO) << "🔍 Starting node selection from " << vec.size() << " candidates";
           auto best_nodes = select_best_nodes(vec, std::min(static_cast<td::uint32>(vec.size()), static_cast<td::uint32>(3)));
+          
           if (!best_nodes.empty()) {
             LOG(INFO) << "🎯 Smart selection completed from " << vec.size() << " candidates, chose: " << best_nodes[0];
             td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, best_nodes[0]);
           } else {
             // **NEW: If all nodes are blacklisted, request more nodes**
-            LOG(WARNING) << "⚠️ All initial nodes blacklisted, requesting more candidates...";
+            LOG(WARNING) << "⚠️ All initial nodes blacklisted or filtered, requesting more candidates...";
             // Request more nodes when initial selection fails
             auto P2 = td::PromiseCreator::lambda([SelfId](td::Result<std::vector<adnl::AdnlNodeIdShort>> R2) {
               if (R2.is_error()) {
