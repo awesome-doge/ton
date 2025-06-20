@@ -36,6 +36,7 @@ namespace fullnode {
 struct NodeQuality {
   td::uint32 success_count = 0;
   td::uint32 failure_count = 0;
+  td::uint32 archive_not_found_count = 0;  // **NEW: Track specific error type**
   td::Timestamp last_success;
   td::Timestamp last_failure;
   double avg_speed = 0.0;
@@ -44,11 +45,23 @@ struct NodeQuality {
     if (success_count + failure_count == 0) return 0.5;
     double success_rate = double(success_count) / (success_count + failure_count);
     double time_penalty = (td::Timestamp::now().at() - last_failure.at()) < 600.0 ? 0.3 : 0.0;
+    
+    // **NEW: Less penalty for "archive not found" errors (data availability issue, not node issue)**
+    if (archive_not_found_count > failure_count * 0.8) {
+      time_penalty *= 0.5;  // Reduce penalty for data availability issues
+    }
+    
     return std::max(0.0, success_rate - time_penalty);
   }
   
   bool is_blacklisted() const {
-    return failure_count >= 3 && (td::Timestamp::now().at() - last_failure.at()) < 900.0;  // 15min blacklist
+    // **NEW: Shorter blacklist for "archive not found" dominant failures**
+    double blacklist_time = 900.0;  // Default 15 minutes
+    if (archive_not_found_count > failure_count * 0.7) {
+      blacklist_time = 300.0;  // Only 5 minutes for data availability issues
+    }
+    
+    return failure_count >= 3 && (td::Timestamp::now().at() - last_failure.at()) < blacklist_time;
   }
 };
 
@@ -164,7 +177,7 @@ void DownloadArchiveSlice::start_up() {
             << " " << shard_prefix_.to_str();
 
   if (download_from_.is_zero() && client_.empty()) {
-    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), this](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
       if (R.is_error()) {
         td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query, R.move_as_error());
       } else {
@@ -179,8 +192,26 @@ void DownloadArchiveSlice::start_up() {
             LOG(INFO) << "🔍 Selected best node from " << vec.size() << " candidates";
             td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, best_nodes[0]);
           } else {
-            // Fallback to random if all nodes are blacklisted
-            td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, vec[0]);
+            // **NEW: If all nodes are blacklisted, request more nodes**
+            LOG(WARNING) << "⚠️ All initial nodes blacklisted, requesting more candidates...";
+            // Request more nodes when initial selection fails
+            auto P2 = td::PromiseCreator::lambda([SelfId](td::Result<std::vector<adnl::AdnlNodeIdShort>> R2) {
+              if (R2.is_error()) {
+                td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query, R2.move_as_error());
+              } else {
+                auto vec2 = R2.move_as_ok();
+                if (!vec2.empty()) {
+                  LOG(INFO) << "🔄 Fallback to any available node from " << vec2.size() << " candidates";
+                  td::actor::send_closure(SelfId, &DownloadArchiveSlice::got_node_to_download, vec2[0]);
+                } else {
+                  td::actor::send_closure(SelfId, &DownloadArchiveSlice::abort_query,
+                                          td::Status::Error(ErrorCode::notready, "no fallback nodes"));
+                }
+              }
+            });
+            // Request more nodes as fallback - call directly, not via actor
+            request_more_nodes(std::move(P2));
+            return;
           }
         }
       }
@@ -253,6 +284,7 @@ void DownloadArchiveSlice::got_archive_info(td::BufferSlice data) {
                                          auto& quality = node_qualities_[download_from_];
                                          quality.failure_count++;
                                          quality.last_failure = td::Timestamp::now();
+                                         quality.archive_not_found_count++;
                                          LOG(WARNING) << "❌ Node " << download_from_ << " archive not found, score=" << quality.get_score();
                                          
                                          abort_query(td::Status::Error(ErrorCode::notready, "remote db not found"));
@@ -319,6 +351,15 @@ void DownloadArchiveSlice::got_archive_slice(td::BufferSlice data) {
   } else {
     get_archive_slice();
   }
+}
+
+// **NEW: Method to request more nodes when initial selection fails**
+void DownloadArchiveSlice::request_more_nodes(td::Promise<std::vector<adnl::AdnlNodeIdShort>> promise) {
+  LOG(INFO) << "🔄 Requesting additional nodes due to blacklist situation";
+  
+  // Request double the usual amount for better chances
+  td::actor::send_closure(overlays_, &overlay::Overlays::get_overlay_random_peers, local_id_, overlay_id_, 12,
+                          std::move(promise));
 }
 
 }  // namespace fullnode
