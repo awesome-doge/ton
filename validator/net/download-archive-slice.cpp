@@ -395,6 +395,11 @@ void DownloadArchiveSlice::start_up() {
   LOG(INFO) << "📦 Starting optimized download of archive slice #" << masterchain_seqno_ 
             << " " << shard_prefix_.to_str();
 
+  // **DEBUG: Add comprehensive debugging info**
+  LOG(INFO) << "🔍 DEBUG: download_from_.is_zero()=" << download_from_.is_zero() 
+            << " | client_.empty()=" << client_.empty()
+            << " | Total known qualities=" << node_qualities_.size();
+
   if (download_from_.is_zero() && client_.empty()) {
     // **ENHANCED: More aggressive reuse of successful nodes**
     std::vector<adnl::AdnlNodeIdShort> excellent_nodes;

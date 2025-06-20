@@ -1009,10 +1009,12 @@ void FullNodeShardImpl::get_next_key_blocks(BlockIdExt block_id, td::Timestamp t
 
 void FullNodeShardImpl::download_archive(BlockSeqno masterchain_seqno, ShardIdFull shard_prefix, std::string tmp_dir,
                                          td::Timestamp timeout, td::Promise<std::string> promise) {
-  auto &b = choose_neighbour();
+  // **SMART NODE SELECTION: Let DownloadArchiveSlice choose the best node using its optimization logic**
+  // auto &b = choose_neighbour();  // **REMOVED: Don't pre-select a neighbor**
   td::actor::create_actor<DownloadArchiveSlice>(
-      "archive", masterchain_seqno, shard_prefix, std::move(tmp_dir), adnl_id_, overlay_id_, b.adnl_id, timeout,
-      validator_manager_, rldp2_, overlays_, adnl_, client_, create_neighbour_promise(b, std::move(promise)))
+      "archive", masterchain_seqno, shard_prefix, std::move(tmp_dir), adnl_id_, overlay_id_, 
+      adnl::AdnlNodeIdShort::zero(),  // **CHANGED: Pass zero so DownloadArchiveSlice can use its smart selection**
+      timeout, validator_manager_, rldp2_, overlays_, adnl_, client_, std::move(promise))  // **REMOVED: create_neighbour_promise wrapper**
       .release();
 }
 
