@@ -354,9 +354,14 @@ endif()
 set_target_properties(fift-lib PROPERTIES OUTPUT_NAME fift)
 
 add_executable(fift fift/fift-main.cpp)
-target_link_libraries(fift PUBLIC fift-lib git)
+target_link_libraries(fift PUBLIC fift-lib git ${JEMALLOC_LIBRARIES})
 if (WINGETOPT_FOUND)
   target_link_libraries_system(fift wingetopt)
+endif()
+
+if (JEMALLOC_FOUND)
+  target_include_directories(fift PRIVATE ${JEMALLOC_INCLUDE_DIR})
+  target_compile_definitions(fift PRIVATE -DTON_USE_JEMALLOC=1)
 endif()
 
 add_library(src_parser ${PARSER_SOURCE})
@@ -374,9 +379,14 @@ endif()
 
 add_executable(func func/func-main.cpp ${FUNC_LIB_SOURCE})
 target_include_directories(func PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
-target_link_libraries(func PUBLIC ton_crypto src_parser git)
+target_link_libraries(func PUBLIC ton_crypto src_parser git ${JEMALLOC_LIBRARIES})
 if (WINGETOPT_FOUND)
   target_link_libraries_system(func wingetopt)
+endif()
+
+if (JEMALLOC_FOUND)
+  target_include_directories(func PRIVATE ${JEMALLOC_INCLUDE_DIR})
+  target_compile_definitions(func PRIVATE -DTON_USE_JEMALLOC=1)
 endif()
 
 if (USE_EMSCRIPTEN)
@@ -406,10 +416,6 @@ target_include_directories(tlbc PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_
 target_link_libraries(tlbc PUBLIC src_parser)
 if (WINGETOPT_FOUND)
   target_link_libraries_system(tlbc wingetopt)
-endif()
-
-if (WINGETOPT_FOUND)
-  target_link_libraries_system(fift wingetopt)
 endif()
 
 add_executable(mintless-proof-generator util/mintless-proof-generator.cpp)

@@ -109,6 +109,29 @@ Open an elevated (Run as Administrator) `x86-64 Native Tools Command Prompt for 
   build-windows.bat
 ```
 
+### Memory optimization with jemalloc
+For memory-intensive applications like the validator, using the `jemalloc` memory allocator can lead to better performance and reduced memory fragmentation.
+
+To enable `jemalloc`, you first need to install it.
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install -y libjemalloc-dev
+```
+
+**MacOS (using Homebrew):**
+```bash
+brew install jemalloc
+```
+
+Then, configure the build with the `-DTON_USE_JEMALLOC=ON` flag:
+```bash
+cmake .. -DTON_USE_JEMALLOC=ON
+# Or, if you use the build scripts:
+# Modify the cmake command within the script to include the flag.
+```
+Then build the project as usual. This will link the major executables against `jemalloc`.
+
 ### Building TON to WebAssembly
 Install additional system libraries on Ubuntu
 ```bash

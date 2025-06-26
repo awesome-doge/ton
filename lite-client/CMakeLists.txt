@@ -3,6 +3,11 @@ add_library(lite-client-common STATIC lite-client-common.cpp lite-client-common.
 target_link_libraries(lite-client-common PUBLIC tdactor adnllite tl_api tl_lite_api tl-lite-utils ton_crypto)
 
 add_executable(lite-client lite-client.cpp lite-client.h ext-client.h ext-client.cpp)
-target_link_libraries(lite-client tdutils tdactor adnllite tl_api tl_lite_api tl-lite-utils terminal lite-client-common git)
+target_link_libraries(lite-client tdutils tdactor adnllite tl_api tl_lite_api tl-lite-utils terminal lite-client-common git ${JEMALLOC_LIBRARIES})
+
+if (JEMALLOC_FOUND)
+  target_include_directories(lite-client PRIVATE ${JEMALLOC_INCLUDE_DIR})
+  target_compile_definitions(lite-client PRIVATE -DTON_USE_JEMALLOC=1)
+endif()
 
 install(TARGETS lite-client RUNTIME DESTINATION bin)
